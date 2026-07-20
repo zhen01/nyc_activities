@@ -1,0 +1,4 @@
+{
+  "_comment": "Curated, human-verified activities pulled from sources.yaml. This is the ONLY data the recommendation engine reads from at query time -- nothing is scraped or invented live. Empty placeholder until the first curation pass (see STATUS.md next deliverable).",
+  "activities": []
+}

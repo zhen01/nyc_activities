@@ -1,0 +1,15 @@
+# Core web framework
+fastapi
+uvicorn[standard]
+
+# Data validation / settings
+pydantic
+pydantic-settings
+
+# Database
+sqlalchemy
+# psycopg2-binary   # uncomment when moving from SQLite to Postgres
+
+# Dev/test
+pytest
+httpx

@@ -1,0 +1,21 @@
+# Human-maintained directory of small NYC organizations and community
+# channels. Each entry documents WHERE to find verified activity
+# information manually — not the activities themselves (those live in
+# seed_activities.json once curated). See docs/source_directory_guide.md.
+#
+# Fields:
+#   name:            organization or community name
+#   category:        e.g. sports, volunteering, language_exchange, outdoors, arts
+#   channel_type:    website | instagram | newsletter | meetup | eventbrite | other
+#   url:             link to the source
+#   update_cadence:  how often the curator should re-check this source
+#   last_checked:    YYYY-MM-DD, updated manually by curator
+#   notes:           anything relevant (e.g. "posts are Instagram Stories only")
+
+- name: "EXAMPLE: NYC Social Sports League"
+  category: sports
+  channel_type: website
+  url: "https://example.org"
+  update_cadence: weekly
+  last_checked: null
+  notes: "Placeholder entry — replace with real curated sources."
