@@ -1,9 +1,33 @@
 # NYC Activity Discovery Engine
 
+[![CI](https://github.com/zhen01/nyc_activities/actions/workflows/ci.yml/badge.svg)](https://github.com/zhen01/nyc_activities/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
+
 A personalized activity discovery tool for NYC: give it a free-time window, budget, and
-a few constraints, and get back 1-3 real, feasible, source-backed activities — including
+a few constraints, and get back 1-5 real, feasible, source-backed activities — including
 ones from small organizations (social sports leagues, free kayaking programs, volunteer
 marketplaces, language exchanges) that don't show up on mainstream event platforms.
+
+Built as an end-to-end personal data project: a FastAPI recommendation service with
+transparent, inspectable scoring, backed by a Postgres ingestion pipeline and a dbt
+analytics layer, all exercised by an automated test suite and CI on every PR.
+
+## Table of Contents
+
+- [Problem](#problem)
+- [Product Principles](#product-principles)
+- [Features](#features)
+- [Tech Stack](#tech-stack)
+- [Architecture](#architecture)
+- [Quick Start](#quick-start-the-mvp)
+- [Repo Structure](#repo-structure)
+- [Local Data Ingestion (Postgres)](#local-data-ingestion-postgres)
+- [External Source: NYC Parks Public Events](#external-source-nyc-parks-public-events)
+- [Analytics Layer: dbt](#analytics-layer-dbt-mart_activity_candidates)
+- [Continuous Integration](#continuous-integration)
+- [Status & Roadmap](#status--roadmap)
+- [License](#license)
 
 ## Problem
 
@@ -27,42 +51,67 @@ being deliberately small and feasibility-first.
 6. **Human-maintainable sources** — a manual source directory is acceptable when
    automation is unreliable or inappropriate.
 
-## Repo Structure
+## Features
 
-| Path | Purpose |
+- **Two-stage recommendation pipeline** — hard feasibility filtering, then transparent,
+  component-based scoring (no black-box model).
+- **Three request modes** — `specific` (hard category filter), `mood` (rank by vibe-tag
+  match), `surprise` (weighted-random sample from the top-scored pool, reproducible via a
+  fixed seed).
+- **Explainable results** — every recommendation ships a `score`, a `confidence_label`
+  derived from source-channel type and check recency, and a rule-based "why this fits"
+  string.
+- **Live external data source** — NYC Parks public events pulled from the NYC Open Data
+  Socrata API, upserted idempotently alongside curated CSV data.
+- **Idempotent ingestion** — CSV and API ingestion both upsert on a natural key; rerunning
+  produces `0 inserted, N updated`, never duplicate rows.
+- **dbt analytics mart** — a single `mart_activity_candidates` model that enforces every
+  business rule (expired events, inactive sources, unknown-price-is-not-free, stale
+  sources) in one place, with a singular SQL test per rule.
+- **CI on every PR** — lint (`ruff`, `sqlfluff`), two pytest suites, ingestion, and
+  `dbt build` all run against a real Postgres service container.
+
+## Tech Stack
+
+| Layer | Tools |
 |---|---|
-| `backend/app/main.py` | FastAPI entrypoint |
-| `backend/app/api/` | HTTP routes (`POST /recommendations`) |
-| `backend/app/models/schema.py` | Request/response models (`UserConstraints`, `Recommendation`) |
-| `backend/app/services/filter_engine.py` | Feasibility filtering (excludes expired/incompatible events) — principle #1 |
-| `backend/app/services/scoring_engine.py` | Transparent ranking (proximity, vibe match, source confidence) |
-| `backend/app/services/geo.py` | ZIP centroid lookup + straight-line distance |
-| `backend/app/services/explain_engine.py` | "Why this fits" explanation generation — principle #4 |
-| `data/sample/zip_centroids.csv` | Small curated NYC ZIP → lat/lon lookup table (no geocoding API) |
-| `backend/app/db/` | DB connection + ORM models (`Organization`, `Activity`, `Source`) |
-| `backend/data/sources.yaml` | Manually maintained directory of orgs/channels — principle #6 |
-| `backend/data/seed_activities.json` | Curated, human-verified activities actually served to users |
-| `backend/scripts/load_seed_data.py` | Loads seed data into the database |
-| `backend/tests/` | Unit tests, starting with the filter engine |
-| `frontend/src/` | Minimal React UI: one constraint form, one results list |
-| `docs/source_directory_guide.md` | How to add/maintain a source and promote it to a seed activity |
-| `ARCHITECTURE.md` | How data flows end to end |
-| `STATUS.md` | What currently works, the highest-risk issue, and the next deliverable |
-| `docker-compose.yml` | Local Postgres for the ingestion vertical slice |
-| `data/sample/*.csv` | Curated sample data loaded by the ingestion module |
-| `ingestion/db.py` | Engine, `raw` schema table definitions, upsert helper |
-| `ingestion/validate.py` | Required-column/value and date validation |
-| `ingestion/ingest.py` | Reads CSVs, validates, upserts into Postgres, logs counts |
-| `ingestion/nyc_parks.py` | Fetches/parses/loads the NYC Parks API into `raw.nyc_parks_events`, isolated from the CSV path |
-| `ingestion/tests/` | Validation, dedup, and NYC Parks ingestion tests |
-| `dbt/models/staging/` | Renaming-only views over `raw.*` (`stg_activity_sources`, `stg_activity_events`) |
-| `dbt/models/intermediate/int_activity_enriched.sql` | Joins staging + `zip_centroids` seed; computes freshness, audience-fit scores, discovery/actionability scores |
-| `dbt/models/marts/mart_activity_candidates.sql` | The recommendable-events mart — applies every business-rule exclusion in one place |
-| `dbt/tests/` | Singular SQL tests mapping 1:1 to each business rule (expired, inactive source, unknown price, stale freshness, missing URL) |
-| `.github/workflows/ci.yml` | Runs on every PR: `ruff`, `sqlfluff`, both pytest suites, ingestion, `dbt build` |
-| `Makefile` | `db-up`, `db-down`, `ingest`, `test`, `test-backend`, `dbt-deps`, `dbt-seed`, `dbt-build` |
+| API | FastAPI, Pydantic, Uvicorn |
+| Frontend | Plain HTML/JS (`backend/app/static/`) — no build step required |
+| Ingestion | Python, SQLAlchemy, psycopg, requests, pandas |
+| Database | PostgreSQL 16 (Docker Compose locally) |
+| Analytics | dbt (staging → intermediate → mart), sqlfluff |
+| Testing | pytest (backend + ingestion suites, 18+ tests) |
+| CI/CD | GitHub Actions, Postgres service container |
+| External data | NYC Open Data Socrata API (NYC Parks public events) |
 
-## Running the MVP
+## Architecture
+
+```
+sources.yaml (curator finds & lists orgs/channels manually)
+      │
+      ▼  curator manually verifies an activity is real & current
+seed_activities.json / data/sample/*.csv (curated, human-verified)
+      │
+      ▼
+filter_engine.py   — hard constraints only (feasibility before attractiveness)
+      │  small candidate set
+      ▼
+scoring_engine.py  — transparent, inspectable ranking (proximity, vibe, source confidence)
+      │
+      ▼
+explain_engine.py  — "why this fits" + explicit uncertainty
+      │
+      ▼
+POST/GET /recommendations  →  static HTML/JS UI
+```
+
+Separately, `ingestion/` loads the same curated data (plus live NYC Parks events) into
+Postgres, and `dbt/` builds an analytics mart on top of that raw data — see
+[ARCHITECTURE.md](ARCHITECTURE.md) for the full data-flow diagram and rationale, and
+[STATUS.md](STATUS.md) for exactly which pieces are wired together today versus still
+independent tracks.
+
+## Quick Start (the MVP)
 
 The fastest way to see the product loop end to end (no Docker required — this reads
 `data/sample/*.csv` directly rather than Postgres):
@@ -75,10 +124,11 @@ make mvp
 ```
 
 Open http://localhost:8000 in a browser, set constraints, and click "Find activities".
-Or query the API directly: `curl "http://localhost:8000/recommendations?category=sports&max_cost=15&solo_friendly=true"`.
+Or query the API directly:
 
-This MVP is intentionally decoupled from the Postgres ingestion pipeline below — see
-STATUS.md for why, and what it'll take to wire them together.
+```bash
+curl "http://localhost:8000/recommendations?category=sports&max_cost=15&solo_friendly=true"
+```
 
 ### Inputs and ranking behavior
 
@@ -107,6 +157,42 @@ The API returns up to the **top 5** results, each including `score`, `confidence
 (`High`/`Medium`/`Low`, based on the source's channel type and how recently it was
 checked relative to its own update cadence), `source_name`, `source_verified_date`,
 `distance_miles` (nullable), and a rule-based `explanation` string.
+
+## Repo Structure
+
+| Path | Purpose |
+|---|---|
+| `backend/app/main.py` | FastAPI entrypoint |
+| `backend/app/api/` | HTTP routes (`POST /recommendations`) |
+| `backend/app/models/schema.py` | Request/response models (`UserConstraints`, `Recommendation`) |
+| `backend/app/services/filter_engine.py` | Feasibility filtering (excludes expired/incompatible events) — principle #1 |
+| `backend/app/services/scoring_engine.py` | Transparent ranking (proximity, vibe match, source confidence) |
+| `backend/app/services/geo.py` | ZIP centroid lookup + straight-line distance |
+| `backend/app/services/explain_engine.py` | "Why this fits" explanation generation — principle #4 |
+| `data/sample/zip_centroids.csv` | Small curated NYC ZIP → lat/lon lookup table (no geocoding API) |
+| `backend/app/db/` | DB connection + ORM models (`Organization`, `Activity`, `Source`) |
+| `backend/data/sources.yaml` | Manually maintained directory of orgs/channels — principle #6 |
+| `backend/data/seed_activities.json` | Curated, human-verified activities actually served to users |
+| `backend/scripts/load_seed_data.py` | Loads seed data into the database |
+| `backend/tests/` | Unit tests, starting with the filter engine |
+| `backend/app/static/` | Minimal HTML/JS UI: one constraint form, one results list |
+| `frontend/src/` | React scaffold (unused for now — see STATUS.md) |
+| `docs/source_directory_guide.md` | How to add/maintain a source and promote it to a seed activity |
+| `ARCHITECTURE.md` | How data flows end to end |
+| `STATUS.md` | What currently works, the highest-risk issue, and the next deliverable |
+| `docker-compose.yml` | Local Postgres for the ingestion vertical slice |
+| `data/sample/*.csv` | Curated sample data loaded by the ingestion module |
+| `ingestion/db.py` | Engine, `raw` schema table definitions, upsert helper |
+| `ingestion/validate.py` | Required-column/value and date validation |
+| `ingestion/ingest.py` | Reads CSVs, validates, upserts into Postgres, logs counts |
+| `ingestion/nyc_parks.py` | Fetches/parses/loads the NYC Parks API into `raw.nyc_parks_events`, isolated from the CSV path |
+| `ingestion/tests/` | Validation, dedup, and NYC Parks ingestion tests |
+| `dbt/models/staging/` | Renaming-only views over `raw.*` (`stg_activity_sources`, `stg_activity_events`) |
+| `dbt/models/intermediate/int_activity_enriched.sql` | Joins staging + `zip_centroids` seed; computes freshness, audience-fit scores, discovery/actionability scores |
+| `dbt/models/marts/mart_activity_candidates.sql` | The recommendable-events mart — applies every business-rule exclusion in one place |
+| `dbt/tests/` | Singular SQL tests mapping 1:1 to each business rule (expired, inactive source, unknown price, stale freshness, missing URL) |
+| `.github/workflows/ci.yml` | Runs on every PR: `ruff`, `sqlfluff`, both pytest suites, ingestion, `dbt build` |
+| `Makefile` | `db-up`, `db-down`, `ingest`, `test`, `test-backend`, `dbt-deps`, `dbt-seed`, `dbt-build` |
 
 ## Local Data Ingestion (Postgres)
 
@@ -310,7 +396,13 @@ pytest suites, `python -m ingestion` (to populate `raw.*`), then `dbt deps` / `d
 / `dbt build`. The point isn't a complex pipeline — it's that a broken data model or a
 failing test is caught automatically before merge, not discovered later in Postgres.
 
-## Status
+## Status & Roadmap
 
-This repo is currently a structural scaffold — see [STATUS.md](STATUS.md) for what's
-implemented, what isn't, and what to build next.
+This repo has a runnable MVP, a working ingestion pipeline, and a dbt analytics mart —
+but they're not all wired together yet. See [STATUS.md](STATUS.md) for exactly what's
+implemented, the current highest-risk issue, and the next planned deliverable
+(pointing `filter_engine.py` at Postgres instead of flat CSVs).
+
+## License
+
+[MIT](LICENSE) © Zhen Fang
