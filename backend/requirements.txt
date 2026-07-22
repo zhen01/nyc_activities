@@ -6,6 +6,9 @@ uvicorn[standard]
 pydantic
 pydantic-settings
 
+# Reading the CSV sample data for the MVP filter engine
+pandas
+
 # Database
 sqlalchemy
 # psycopg2-binary   # uncomment when moving from SQLite to Postgres
