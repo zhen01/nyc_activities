@@ -1,0 +1,7 @@
+source_id,name,category,channel_type,url,update_cadence,last_checked,notes,is_active,image_url
+nyc-social-sports-league,NYC Social Sports League,active,website,https://nycsocialsportsleague.example.org,weekly,2026-07-01,Pickup and league play; solo signups welcome,true,
+free-kayaking-nyc,Downtown Boathouse Free Kayaking,outdoors,website,https://freekayaking.example.org,seasonal,2026-06-15,Free walk-up kayaking on the Hudson; weather dependent,true,
+volunteer-shift-market,NYC Volunteer Shift Marketplace,volunteer,website,https://volunteershifts.example.org,daily,2026-07-10,Same-day and same-week shifts across the city,true,
+polyglot-exchange-nyc,Polyglot Language Exchange NYC,social,meetup,https://polyglotnyc.example.org,weekly,2026-07-05,Weekly meetups; beginner friendly,true,
+open-mic-collective,NYC Open Mic Collective,culture,instagram,https://instagram.com/example_openmic,weekly,2026-07-12,Posts new mic nights via Instagram Stories only,true,
+closed-yoga-studio,Closed Yoga Studio (Test Fixture),active,website,https://closedyogastudio.example.org,weekly,2026-05-01,Permanently closed -- kept as an inactive-source test fixture,false,

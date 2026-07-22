@@ -1,0 +1,32 @@
+name: 'nyc_activities'
+version: '1.0.0'
+config-version: 2
+
+profile: 'nyc_activities'
+
+model-paths: ["models"]
+seed-paths: ["seeds"]
+test-paths: ["tests"]
+macro-paths: ["macros"]
+
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+models:
+  nyc_activities:
+    staging:
+      +materialized: view
+    intermediate:
+      +materialized: view
+    marts:
+      +materialized: table
+
+seeds:
+  nyc_activities:
+    zip_centroids:
+      +column_types:
+        zip_code: varchar(10)
+        lat: float8
+        lon: float8
+        borough: varchar

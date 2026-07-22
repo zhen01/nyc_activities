@@ -14,3 +14,9 @@ dist/
 
 # OS
 .DS_Store
+
+# dbt
+dbt/target/
+dbt/dbt_packages/
+dbt/logs/
+dbt/.user.yml

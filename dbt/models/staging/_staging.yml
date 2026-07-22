@@ -1,0 +1,54 @@
+version: 2
+
+sources:
+  - name: raw
+    schema: raw
+    description: Bronze-layer tables loaded verbatim by ingestion/db.py.
+    tables:
+      - name: activity_sources
+        columns:
+          - name: source_id
+            tests:
+              - unique
+              - not_null
+          - name: is_active
+            tests:
+              - not_null
+      - name: activity_events
+        columns:
+          - name: event_id
+            tests:
+              - unique
+              - not_null
+          - name: source_id
+            tests:
+              - not_null
+              - relationships:
+                  arguments:
+                    to: source('raw', 'activity_sources')
+                    field: source_id
+
+models:
+  - name: stg_activity_sources
+    description: Cleaned/renamed activity_sources, one row per source.
+    columns:
+      - name: source_id
+        tests:
+          - unique
+          - not_null
+      - name: channel_type
+        tests:
+          - accepted_values:
+              arguments:
+                values: ['website', 'meetup', 'instagram']
+
+  - name: stg_activity_events
+    description: Cleaned/renamed activity_events, one row per event.
+    columns:
+      - name: event_id
+        tests:
+          - unique
+          - not_null
+      - name: source_id
+        tests:
+          - not_null

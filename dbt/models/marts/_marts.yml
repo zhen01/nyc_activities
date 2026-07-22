@@ -1,0 +1,44 @@
+version: 2
+
+models:
+  - name: mart_activity_candidates
+    description: >
+      Recommendable activity candidates. Expired events, inactive sources,
+      abandoned-freshness sources, and structurally invalid rows are
+      excluded upstream -- every row in this mart could be shown to a user
+      today. See dbt/tests/ for singular tests mapping 1:1 to each business
+      rule.
+    columns:
+      - name: event_id
+        tests:
+          - unique
+          - not_null
+      - name: event_name
+        tests:
+          - not_null
+      - name: activity_family
+        tests:
+          - accepted_values:
+              arguments:
+                values: ['active', 'community', 'social_learning', 'creative', 'other']
+      - name: freshness_status
+        tests:
+          - accepted_values:
+              arguments:
+                values: ['fresh', 'stale']
+      - name: group_suitability
+        tests:
+          - accepted_values:
+              arguments:
+                values: ['solo_private', 'solo_social', 'couple', 'small_group']
+      - name: social_structure
+        tests:
+          - accepted_values:
+              arguments:
+                values: ['group_required', 'solo_friendly', 'solo_or_social', 'solo_or_group']
+      - name: source_url
+        tests:
+          - not_null
+      - name: start_at
+        tests:
+          - not_null

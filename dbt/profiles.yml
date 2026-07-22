@@ -1,0 +1,19 @@
+# Project-local profile (not ~/.dbt/profiles.yml) so this repo is
+# self-contained. Run dbt from this directory, or pass
+# --profiles-dir dbt / export DBT_PROFILES_DIR=dbt from the repo root.
+#
+# Reuses the same POSTGRES_* env vars as ingestion/db.py and
+# docker-compose.yml (see .env.example) -- one connection config for the
+# whole project, not a second one to keep in sync.
+nyc_activities:
+  target: dev
+  outputs:
+    dev:
+      type: postgres
+      host: "{{ env_var('POSTGRES_HOST', 'localhost') }}"
+      port: "{{ env_var('POSTGRES_PORT', '5432') | as_number }}"
+      user: "{{ env_var('POSTGRES_USER') }}"
+      password: "{{ env_var('POSTGRES_PASSWORD') }}"
+      dbname: "{{ env_var('POSTGRES_DB') }}"
+      schema: analytics
+      threads: 4

@@ -1,0 +1,80 @@
+name: CI
+
+# The goal here isn't a fancy pipeline -- it's that every PR proves the data
+# model still holds: lint, unit tests, then load real fixture data through
+# ingestion and rebuild+test the dbt mart against it.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+env:
+  POSTGRES_USER: nyc_activities
+  POSTGRES_PASSWORD: nyc_activities
+  POSTGRES_DB: nyc_activities
+  POSTGRES_HOST: localhost
+  POSTGRES_PORT: "5432"
+  DATABASE_URL: postgresql+psycopg://nyc_activities:nyc_activities@localhost:5432/nyc_activities
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: nyc_activities
+          POSTGRES_PASSWORD: nyc_activities
+          POSTGRES_DB: nyc_activities
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U nyc_activities"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install -r ingestion/requirements.txt
+          pip install -r backend/requirements.txt
+
+      - name: ruff check
+        run: ruff check .
+
+      - name: sqlfluff lint (dbt models)
+        working-directory: dbt
+        run: sqlfluff lint models --dialect postgres
+
+      - name: docker compose config
+        run: docker compose config
+
+      - name: pytest (ingestion)
+        run: python -m pytest ingestion/tests
+
+      - name: pytest (backend)
+        working-directory: backend
+        run: python -m pytest tests
+
+      - name: Load fixture data (ingestion)
+        run: python -m ingestion
+
+      - name: dbt deps
+        working-directory: dbt
+        run: dbt deps --profiles-dir .
+
+      - name: dbt seed
+        working-directory: dbt
+        run: dbt seed --profiles-dir .
+
+      - name: dbt build
+        working-directory: dbt
+        run: dbt build --profiles-dir .

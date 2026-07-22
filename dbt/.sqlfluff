@@ -1,0 +1,15 @@
+[sqlfluff]
+templater = dbt
+dialect = postgres
+max_line_length = 100
+# LT02 (strict indent) is overly opinionated about nested CASE/function-call
+# layout in this project's expression-heavy intermediate model; the SQL is
+# still readable, so this rule is skipped rather than reformatted purely to
+# satisfy it.
+exclude_rules = LT02
+
+[sqlfluff:templater:dbt]
+profiles_dir = .
+project_dir = .
+profile = nyc_activities
+target = dev

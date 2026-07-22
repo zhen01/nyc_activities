@@ -34,8 +34,11 @@ being deliberately small and feasibility-first.
 | `backend/app/main.py` | FastAPI entrypoint |
 | `backend/app/api/` | HTTP routes (`POST /recommendations`) |
 | `backend/app/models/schema.py` | Request/response models (`UserConstraints`, `Recommendation`) |
-| `backend/app/services/filter_engine.py` | Feasibility filtering — principle #1 |
+| `backend/app/services/filter_engine.py` | Feasibility filtering (excludes expired/incompatible events) — principle #1 |
+| `backend/app/services/scoring_engine.py` | Transparent ranking (proximity, vibe match, source confidence) |
+| `backend/app/services/geo.py` | ZIP centroid lookup + straight-line distance |
 | `backend/app/services/explain_engine.py` | "Why this fits" explanation generation — principle #4 |
+| `data/sample/zip_centroids.csv` | Small curated NYC ZIP → lat/lon lookup table (no geocoding API) |
 | `backend/app/db/` | DB connection + ORM models (`Organization`, `Activity`, `Source`) |
 | `backend/data/sources.yaml` | Manually maintained directory of orgs/channels — principle #6 |
 | `backend/data/seed_activities.json` | Curated, human-verified activities actually served to users |
@@ -45,6 +48,267 @@ being deliberately small and feasibility-first.
 | `docs/source_directory_guide.md` | How to add/maintain a source and promote it to a seed activity |
 | `ARCHITECTURE.md` | How data flows end to end |
 | `STATUS.md` | What currently works, the highest-risk issue, and the next deliverable |
+| `docker-compose.yml` | Local Postgres for the ingestion vertical slice |
+| `data/sample/*.csv` | Curated sample data loaded by the ingestion module |
+| `ingestion/db.py` | Engine, `raw` schema table definitions, upsert helper |
+| `ingestion/validate.py` | Required-column/value and date validation |
+| `ingestion/ingest.py` | Reads CSVs, validates, upserts into Postgres, logs counts |
+| `ingestion/nyc_parks.py` | Fetches/parses/loads the NYC Parks API into `raw.nyc_parks_events`, isolated from the CSV path |
+| `ingestion/tests/` | Validation, dedup, and NYC Parks ingestion tests |
+| `dbt/models/staging/` | Renaming-only views over `raw.*` (`stg_activity_sources`, `stg_activity_events`) |
+| `dbt/models/intermediate/int_activity_enriched.sql` | Joins staging + `zip_centroids` seed; computes freshness, audience-fit scores, discovery/actionability scores |
+| `dbt/models/marts/mart_activity_candidates.sql` | The recommendable-events mart — applies every business-rule exclusion in one place |
+| `dbt/tests/` | Singular SQL tests mapping 1:1 to each business rule (expired, inactive source, unknown price, stale freshness, missing URL) |
+| `.github/workflows/ci.yml` | Runs on every PR: `ruff`, `sqlfluff`, both pytest suites, ingestion, `dbt build` |
+| `Makefile` | `db-up`, `db-down`, `ingest`, `test`, `test-backend`, `dbt-deps`, `dbt-seed`, `dbt-build` |
+
+## Running the MVP
+
+The fastest way to see the product loop end to end (no Docker required — this reads
+`data/sample/*.csv` directly rather than Postgres):
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate   # skip if already created
+pip install -r backend/requirements.txt
+make mvp
+# equivalent: cd backend && uvicorn app.main:app --reload --port 8000
+```
+
+Open http://localhost:8000 in a browser, set constraints, and click "Find activities".
+Or query the API directly: `curl "http://localhost:8000/recommendations?category=sports&max_cost=15&solo_friendly=true"`.
+
+This MVP is intentionally decoupled from the Postgres ingestion pipeline below — see
+STATUS.md for why, and what it'll take to wire them together.
+
+### Inputs and ranking behavior
+
+Beyond category/budget/solo/date, the form supports:
+
+- **Starting ZIP code** — used to compute straight-line distance to each event (via a
+  small curated `data/sample/zip_centroids.csv` lookup, not a geocoding API). Distance
+  is a *scoring* factor, not a hard filter — an unmapped or omitted ZIP just drops
+  proximity from the ranking rather than erroring or zeroing out results.
+- **Mode**: `specific` (category is a hard filter, today's original behavior),
+  `mood` (category is not required; results are ranked by how well an event's
+  `vibe_tags` match the requested vibe), `surprise` (hard constraints still apply, but
+  the top-scored pool is weighted-sampled rather than a strict top-N, for variety).
+
+Every request runs through two stages:
+
+1. **Feasibility filter** (`filter_engine.py`) — hard pass/fail. Excludes expired events
+   (`start_time` in the past) and anything violating a hard constraint (category in
+   `specific` mode, budget, solo-friendly, date).
+2. **Transparent scoring** (`scoring_engine.py`) — ranks what's left using simple,
+   inspectable components (proximity, vibe match, source confidence), each normalized
+   0–1 and blended into a 0–100 score. Any component whose input wasn't provided (no
+   ZIP, no mood) is dropped from the blend, not fabricated.
+
+The API returns up to the **top 5** results, each including `score`, `confidence_label`
+(`High`/`Medium`/`Low`, based on the source's channel type and how recently it was
+checked relative to its own update cadence), `source_name`, `source_verified_date`,
+`distance_miles` (nullable), and a rule-based `explanation` string.
+
+## Local Data Ingestion (Postgres)
+
+This is the first runnable piece of the project: loading curated sample CSV data into a
+local Postgres database. It does not include the API, UI, or recommendation logic yet.
+
+Note: `data/sample/*.csv` (raw ingestion sample data) is separate from
+`backend/data/sources.yaml` (the curated org directory for the future recommendation
+engine) — same word "sources," different purpose and consumer. Don't conflate them.
+
+### Prerequisites
+
+- Docker Desktop (for `docker compose`)
+- Python 3.11+ recommended (a virtualenv is strongly recommended)
+
+### Setup
+
+```bash
+# 1. Create and activate a virtual environment
+python3 -m venv .venv
+source .venv/bin/activate
+
+# 2. Install ingestion dependencies
+pip install -r ingestion/requirements.txt
+
+# 3. Configure environment variables
+cp .env.example .env
+# edit .env if you want non-default credentials
+
+# 4. Start Postgres
+make db-up
+# equivalent: docker compose up -d db
+
+# 5. Load the environment variables and run ingestion
+export $(grep -v '^#' .env | xargs)
+make ingest
+# equivalent: python -m ingestion
+```
+
+You should see log output like:
+
+```
+sources.csv: 5 inserted, 0 updated
+events.csv: 8 inserted, 0 updated
+```
+
+Running `make ingest` again will report `0 inserted, N updated` — no duplicate rows are
+created, since each row is upserted on its natural key (`source_id` / `event_id`).
+
+### Verifying row counts
+
+```bash
+docker compose exec db psql -U nyc_activities -d nyc_activities \
+  -c "select count(*) from raw.activity_sources;" \
+  -c "select count(*) from raw.activity_events;"
+```
+
+### Running tests
+
+```bash
+pytest ingestion/tests
+# or: make test
+```
+
+Tests validate column/value/date checks and the upsert (dedup) logic directly; the
+dedup tests run against an in-memory SQLite database (no Docker required) since the
+upsert helper is dialect-aware and exercises the same code path against Postgres in
+production.
+
+The MVP's filter/scoring engine has its own test suite:
+
+```bash
+cd backend && python -m pytest tests
+# or: make test-backend
+```
+
+Covers: expired-event exclusion, hard-constraint filtering per mode, proximity/vibe/
+confidence scoring components, top-5 ranking order, and surprise-mode sampling
+(including reproducibility with a fixed random seed).
+
+### Stopping Postgres
+
+```bash
+make db-down
+# equivalent: docker compose down
+```
+
+## External Source: NYC Parks Public Events
+
+The second source in the raw layer: upcoming NYC Parks public events, fetched live
+from the NYC Open Data Socrata API ("NYC Parks Public Events - Upcoming 14 Days",
+dataset `w3wp-dpdi`). This is isolated from the curated-CSV path above --
+`ingestion/nyc_parks.py` owns its own fetch/parse/table logic and writes to its own
+table, only reusing the generic engine/upsert helpers from `ingestion/db.py`.
+
+### Environment variables
+
+| Variable | Required | Purpose |
+|---|---|---|
+| `DATABASE_URL` | yes | Same connection string used by the CSV ingestion (see above) |
+| `NYC_OPEN_DATA_APP_TOKEN` | no | Optional Socrata app token; raises the default public rate limit. Not required for normal use |
+| `NYC_PARKS_RECORD_LIMIT` | no | Max records to fetch per run (default 200), paginated in batches of 50 |
+
+### Running the API ingestion
+
+```bash
+make db-up      # if not already running
+export $(grep -v '^#' .env | xargs)
+make ingest-parks
+# equivalent: python -m ingestion.nyc_parks
+```
+
+Output looks like:
+
+```
+nyc_parks: fetched 20 raw record(s) from the API
+nyc_parks_events: 20 inserted, 0 updated, 0 failed
+```
+
+Re-running upserts by the API's `guid` (stored as `source_record_id`) -- no
+duplicates, existing rows are never deleted, and rows are updated in place with a
+fresh `ingested_at`.
+
+### Expected raw table
+
+`raw.nyc_parks_events`: `source_record_id` (PK, the API's `guid`), a handful of
+directly-copied fields (`title`, `startdate`, `enddate`, `starttime`, `endtime`,
+`location`, `parknames`, `categories`, `link_url`, `registration_url`), a
+`raw_payload` JSON column holding the full original API record, and `ingested_at`.
+No business normalization happens here (categories aren't mapped, costs aren't
+inferred, etc.) -- that's deferred to a later curated/staging step.
+
+### Verifying row counts
+
+```bash
+docker compose exec db psql -U nyc_activities -d nyc_activities \
+  -c "select count(*) from raw.nyc_parks_events;" \
+  -c "select source_record_id, title, startdate, location from raw.nyc_parks_events limit 5;"
+```
+
+## Analytics Layer: dbt (`mart_activity_candidates`)
+
+A dbt project under `dbt/` turns `raw.activity_sources` / `raw.activity_events` into a
+single mart of records that could plausibly be recommended, with every business rule
+enforced in one place instead of scattered across application code.
+
+**Business rules** (each one has a matching singular test in `dbt/tests/`):
+
+- Expired events cannot appear (`coalesce(end_at, start_at) >= now()`).
+- Inactive sources cannot appear (`is_active = true`).
+- An unknown price must never be treated as free — `NULL` stays `NULL` all the way
+  through staging into the mart, it's never coalesced to `0`.
+- Events whose source hasn't been checked recently enough (`freshness_status =
+  'abandoned'`, see below) are excluded, not just penalized.
+
+**Layering**: `stg_activity_sources` / `stg_activity_events` (rename-only views over
+`raw.*`) → `int_activity_enriched` (joins in the `zip_centroids` seed for `borough`,
+computes `freshness_status` and the audience-fit/discovery/actionability scores) →
+`mart_activity_candidates` (applies every exclusion rule, selects the final field list).
+
+**Freshness**: `freshness_status` is `fresh` / `stale` / `abandoned`, based on days
+since the *source's* `last_checked` relative to its `update_cadence` (`daily`/`weekly`/
+`seasonal` → 1/7/90 days), using the same `CADENCE_DAYS` mapping as
+`backend/app/services/scoring_engine.py` so "freshness" means the same thing in the API
+and in this mart. Only `abandoned` is excluded from the mart; `stale` rows are kept but
+flagged.
+
+**Audience-fit scores** (`solo_private_score`, `solo_social_score`, `couple_score`,
+`small_group_score`, each 0-100): simple, documented point sums from `solo_friendly` +
+`vibe_tags` — rule-based, not a model, so every point is traceable to a specific input
+(consistent with the "no black-box scoring" principle already established for the API).
+`group_suitability` is just the label of whichever of the four scores is highest.
+
+### Running it
+
+```bash
+pip install -r ingestion/requirements.txt   # now includes dbt-core, dbt-postgres, ruff, sqlfluff
+make db-up
+export $(grep -v '^#' .env | xargs)
+make ingest          # populates raw.* that dbt reads from
+make dbt-deps        # installs dbt_utils
+make dbt-seed        # loads dbt/seeds/zip_centroids.csv
+make dbt-build       # runs all models + all tests
+```
+
+`profiles.yml` lives in `dbt/` (not `~/.dbt/`) and reuses the same `POSTGRES_*` env vars
+as `ingestion/` and `docker-compose.yml` — one connection config for the whole project.
+
+Verify the mart directly:
+
+```bash
+docker compose exec db psql -U nyc_activities -d nyc_activities \
+  -c "select event_id, event_name, freshness_status, group_suitability from analytics.mart_activity_candidates;"
+```
+
+## Continuous Integration
+
+`.github/workflows/ci.yml` runs on every pull request against a real Postgres service
+container: `ruff check`, `sqlfluff lint` (dbt models), `docker compose config`, both
+pytest suites, `python -m ingestion` (to populate `raw.*`), then `dbt deps` / `dbt seed`
+/ `dbt build`. The point isn't a complex pipeline — it's that a broken data model or a
+failing test is caught automatically before merge, not discovered later in Postgres.
 
 ## Status
 
