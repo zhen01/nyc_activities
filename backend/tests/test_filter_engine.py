@@ -6,7 +6,7 @@ tests to write first -- the filter+scoring pipeline is the core trust
 mechanism of the product.
 """
 
-from datetime import datetime
+from datetime import datetime, time
 
 from app.models.schema import UserConstraints
 from app.services.filter_engine import build_recommendations, filter_activities
@@ -22,9 +22,9 @@ def test_expired_events_are_excluded():
 
 
 def test_category_is_a_hard_filter_in_specific_mode():
-    constraints = UserConstraints(mode="specific", category="sports")
+    constraints = UserConstraints(mode="specific", category="active")
     df = filter_activities(constraints, now=NOW)
-    assert set(df["category"]) == {"sports"}
+    assert set(df["category"]) == {"active"}
 
 
 def test_category_is_not_a_hard_filter_in_mood_mode():
@@ -126,3 +126,17 @@ def test_proximity_score_decreases_with_distance():
     close = proximity_score(0.5)
     far = proximity_score(7.0)
     assert close > far
+
+
+def test_hours_free_excludes_events_longer_than_stated_free_time():
+    constraints = UserConstraints(mode="specific", hours_free=1.0)
+    df = filter_activities(constraints, now=NOW)
+    assert "evt-001" not in df["event_id"].values, "2-hour event exceeds 1 hour free"
+    assert "evt-010" in df["event_id"].values, "1-hour event fits exactly"
+
+
+def test_after_time_excludes_earlier_start_times():
+    constraints = UserConstraints(mode="specific", after_time=time(15, 0))
+    df = filter_activities(constraints, now=NOW)
+    assert "evt-002" not in df["event_id"].values, "starts at 09:00, before 15:00"
+    assert "evt-001" in df["event_id"].values, "starts at 18:30, after 15:00"

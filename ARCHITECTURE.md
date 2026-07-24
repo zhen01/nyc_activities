@@ -3,56 +3,91 @@
 ## Components
 
 - **Source directory (offline, human-maintained)** — `backend/data/sources.yaml`
-- **Curated dataset (offline, human-verified)** — `backend/data/seed_activities.json`
-- **Database** — SQLite locally / Postgres-ready (`backend/app/db/`)
+- **Curated sample data** — `data/sample/*.csv` (events + sources; read directly by the
+  MVP, and separately loaded into Postgres by `ingestion/`)
+- **Ingestion + raw database** — `ingestion/` loads CSVs (plus live NYC Parks events)
+  into Postgres's `raw` schema; `backend/app/db.py` reuses those same table definitions
+  for the favorites/organizations endpoints (see below)
+- **Analytics mart** — `dbt/` builds `analytics.mart_activity_candidates` on top of
+  `raw.*`, enforcing every business rule in one place (not yet consumed by the API)
 - **API** — FastAPI (`backend/app/`)
-- **Frontend** — minimal React app (`frontend/src/`)
+- **Frontend** — React + Vite + TS Discover page (`frontend/src/`), built and served
+  from `backend/app/static/`
 
-## End-to-end flow
+## End-to-end flow (recommendations)
 
 ```
-sources.yaml (curator finds & lists orgs/channels manually)
-      │
-      ▼  curator manually verifies an activity is real & current
-seed_activities.json (curated, human-verified)
-      │
-      │  scripts/load_seed_data.py
-      ▼
-Database  (Activity, Organization, Source tables)
-      ▲
-      │  query
-ConstraintForm (frontend)
-      │  time window, budget, location, solo?, skill level
-      ▼
-POST /recommendations  (app/api/recommendations.py)
+data/sample/sources.csv, events.csv (curated, human-verified)
       │
       ▼
 filter_engine.py   — hard constraints only (feasibility before attractiveness)
-      │  small candidate set (1-3 items)
+      │  small candidate set
       ▼
-explain_engine.py  — "why this fits" + explicit uncertainty, grounded in DB fields only
+scoring_engine.py  — transparent, inspectable ranking (proximity, vibe, source confidence)
       │
       ▼
-API response (Recommendation[])
+explain_engine.py  — "why this fits" + explicit uncertainty
       │
       ▼
-ActivityCard (frontend) — renders each recommendation + explanation + uncertainty
+presentation.py    — display-only derived fields (badges, tags, category label, transit estimate)
+      │
+      ▼
+GET /recommendations  (app/api/recommendations.py)
+      │  if device_id supplied: one lazy lookup against raw.app_favorites for is_favorited
+      ▼
+React Discover page (frontend/src/App.tsx) — HeroSearch + CategoryFilterRow request params
+      │
+      ▼
+ActivityCard (+ FavoriteButton) — renders each recommendation + explanation + uncertainty
 ```
+
+`GET /recommendations` reads `data/sample/*.csv` directly — it does not read from
+Postgres, even though `ingestion/` populates the same data there. This is deliberate,
+not an oversight (see STATUS.md's "smallest next deliverable"): the CSV path is the
+fastest way to demo the product loop without requiring Docker.
+
+## End-to-end flow (favorites, organizations)
+
+```
+device_id (client-generated UUID, localStorage)
+      │
+      ▼
+POST /favorites {device_id, event_id}  ──┐
+GET  /favorites?device_id=              ├──►  raw.app_favorites  (backend/app/db.py)
+DELETE /favorites/{device_id}/{event_id}─┘         ▲
+                                                     │ reuses table defs from
+GET /organizations  ─────────────────────►  raw.activity_sources / raw.activity_events
+                                              (backend/app/db.py + ingestion/db.py)
+```
+
+Unlike `/recommendations`, `/favorites` and `/organizations` query Postgres's `raw`
+schema directly via SQLAlchemy Core, reusing the same table definitions
+`ingestion/db.py` uses to populate it. This is a **named, accepted architectural
+inconsistency**, not resolved this pass: the API now has two coexisting data paths
+(CSV for recommendations, Postgres for favorites/organizations). See STATUS.md for the
+reasoning and the direction that would eventually unify them (pointing
+`filter_engine.py` at Postgres, likely at `analytics.mart_activity_candidates` rather
+than the raw tables).
 
 ## Why data enters this way
 
 Nothing is scraped or generated live. The only way an activity reaches a user is:
 someone manually finds a source → manually verifies an activity from it → it gets
-written into `seed_activities.json` with a `source_url` and `last_checked` date →
-`load_seed_data.py` puts it in the database. This is intentional (principles #2, #5, #6):
-prove the recommendation logic is useful on a small, trustworthy dataset before ever
-considering scraping or automated ingestion.
+written into `data/sample/events.csv` (or, longer-term, `sources.yaml` +
+`seed_activities.json`) with a `source_url` and `last_checked` date. This is
+intentional (principles #2, #5, #6): prove the recommendation logic is useful on a
+small, trustworthy dataset before ever considering scraping or automated ingestion.
+The same principle applies to the frontend's presentation-layer additions — badges,
+tags, images, weather, and transit time are either derived from fields already backed
+by real data, or (images, weather) explicitly absent/labeled-illustrative rather than
+fabricated. See STATUS.md's "Unnecessary complexity to avoid" section for the specifics
+of what's deliberately still an estimate or a placeholder.
 
 ## Why filtering happens before explaining
 
-`filter_engine.py` only asks "does this fit?" (time, budget, distance, solo-friendly).
-It does not rank by how appealing an activity sounds. `explain_engine.py` runs only on
-the activities that already passed the feasibility filter, and its job is limited to
-describing fit and uncertainty — not to influence which activities were selected.
-Keeping these as separate stages makes principle #1 ("feasibility before
-attractiveness") a structural guarantee rather than a hope.
+`filter_engine.py` only asks "does this fit?" (time, budget, distance, solo-friendly,
+hours free, after-time). It does not rank by how appealing an activity sounds.
+`scoring_engine.py` and `explain_engine.py` run only on the activities that already
+passed the feasibility filter; `presentation.py`'s badges/tags/labels run after that,
+purely for display. Keeping these as separate stages makes principle #1 ("feasibility
+before attractiveness") a structural guarantee rather than a hope.

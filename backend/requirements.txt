@@ -11,7 +11,7 @@ pandas
 
 # Database
 sqlalchemy
-# psycopg2-binary   # uncomment when moving from SQLite to Postgres
+psycopg[binary]   # needed by app/db.py (favorites, organizations) -- see STATUS.md
 
 # Dev/test
 pytest

@@ -16,12 +16,13 @@ Recommendation: what the API returns -- activity fields, the transparent
 
 from __future__ import annotations
 
-from datetime import date, datetime
-from typing import Literal, Optional
+from datetime import date, datetime, time
+from typing import List, Literal, Optional
 
 from pydantic import BaseModel
 
 Mode = Literal["specific", "mood", "surprise"]
+Intent = Literal["meet_people", "solo_time", "explore"]
 
 
 class UserConstraints(BaseModel):
@@ -32,6 +33,13 @@ class UserConstraints(BaseModel):
     zip_code: Optional[str] = None
     mode: Mode = "specific"
     vibe: Optional[str] = None
+    # Hero-search additions for the redesigned Discover page.
+    hours_free: Optional[float] = None
+    intent: Optional[Intent] = None
+    after_time: Optional[time] = None
+    # Anonymous, client-generated UUID (see frontend/src/api/client.ts) used
+    # only to look up this device's favorites -- no login/auth system.
+    device_id: Optional[str] = None
 
 
 class Recommendation(BaseModel):
@@ -40,7 +48,10 @@ class Recommendation(BaseModel):
     category: str
     start_time: datetime
     end_time: Optional[datetime]
-    cost: float
+    # Optional, not defaulted to 0: an unknown cost must never be rendered
+    # as free (see dbt's assert_unknown_price_stays_null.sql for the same
+    # rule enforced in the analytics layer).
+    cost: Optional[float]
     location: str
     solo_friendly: bool
     source_url: Optional[str]
@@ -51,3 +62,13 @@ class Recommendation(BaseModel):
     confidence_score: float
     score: float
     explanation: str
+    # Presentation-layer additions for the redesigned Discover page (see
+    # app/services/presentation.py) -- display-only, derived from fields
+    # already above, never fabricated.
+    image_url: Optional[str] = None
+    category_label: str
+    badges: List[str] = []
+    tags: List[str] = []
+    estimated_transit_minutes: Optional[int] = None
+    duration_minutes: Optional[int] = None
+    is_favorited: Optional[bool] = None

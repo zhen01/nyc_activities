@@ -14,13 +14,16 @@ that serves:
   pool). Each result includes `score`, `confidence_label`, `source_name`,
   `source_verified_date`, `distance_miles`, and a rule-based explanation string
   (principles #1, #3, #4).
-- `GET /` — a static HTML/JS page (`backend/app/static/index.html`) with ZIP, mode
-  (specific/mood/surprise), vibe, category, budget, solo, and date inputs, rendering
-  results as cards with score/confidence/source badges.
+- `GET /` — now the built React Discover page (`frontend/`, see below) served from
+  `backend/app/static/`; the original static HTML/JS page is preserved at
+  `backend/app/static/legacy/index.html` for reference, not deleted.
+- `GET/POST/DELETE /favorites`, `GET /organizations` — new this pass, see below.
 
 Verified with curl across all three modes (specific, mood+ZIP, surprise) and via the
-18-test backend suite (`make test-backend`) covering expiry exclusion, per-mode hard
-filtering, scoring components, ranking order, and surprise-mode reproducibility.
+backend test suite (`make test-backend`, grown from 18 to 40 tests) covering expiry
+exclusion, per-mode hard filtering, scoring components, ranking order, surprise-mode
+reproducibility, presentation-layer badges/tags/transit estimates, and the new
+favorites/organizations endpoints.
 
 Also working, separately: the ingestion vertical slice (`ingestion/`) loads the same
 sample CSVs into a local Postgres `raw` schema via `make ingest`, and is idempotent on
@@ -52,8 +55,29 @@ the MVP or the API — it's a standalone analytics artifact for now, same relati
 the MVP as the raw ingestion tables below.
 
 Also new: `.github/workflows/ci.yml` runs `ruff`, `sqlfluff`, both pytest suites,
-ingestion, and `dbt build` on every PR against a Postgres service container. Verified by
-running every step locally in the same order before committing the workflow.
+ingestion, `dbt build`, and (as of the frontend redesign below) a `frontend/` build
+compile-check on every PR against a Postgres service container. Verified by running
+every step locally in the same order before committing the workflow.
+
+**The Discover page has been redesigned as a React/Vite/TS app** (`frontend/`),
+replacing the plain HTML/JS page as the default UI — see the reversed "No React/Vite
+build" bullet below. It's a single screen (no router): a hero search bar (free time,
+date, after-time, intent — new `UserConstraints` fields), a category filter row over
+the 7-category taxonomy, a photo-card grid of `/recommendations` results (image or a
+CSS category-colored placeholder, badges/tags computed by the new
+`backend/app/services/presentation.py`), a "Discover hidden gems" organizations row
+(`GET /organizations`), and a sidebar (plan-at-a-glance, an explicitly-illustrative
+weather card, a favorites-count summary). Favorites are heart-toggled per card and
+persisted server-side via `GET/POST/DELETE /favorites`, scoped by an anonymous
+`device_id` UUID generated client-side and stored in `localStorage` — no login/auth.
+Verified end to end: `npm run build` compiles clean; `npm run dev` (5173, proxied to
+FastAPI on 8000 via `vite.config.ts`) and the standalone FastAPI static mount (after
+`npm run build` + copying `frontend/dist/*` into `backend/app/static/`, with the prior
+plain-HTML page archived to `backend/app/static/legacy/`) were both exercised manually
+— search filters, category filter, favorite add/remove/persist-across-reload (checked
+via `psql`), and the organizations row all round-tripped correctly. Backend test suite
+grew from 18 to 40 tests (`backend/tests/test_presentation.py`,
+`test_favorites_api.py`, `test_organizations_api.py` added), all green.
 
 While building the dbt mart, found and fixed a real bug in `ingestion/ingest.py`: a
 blank/unknown numeric cell (e.g. `cost`) was round-tripping through pandas as `NaN`
@@ -64,11 +88,24 @@ as free" business rule — a `NaN` in a Postgres `numeric` column sorts/compares
 huge number, not like an absence of data, which would have quietly broken any downstream
 "price is legal" check.
 
-Not working: `backend/app/db/*` (ORM models) and `backend/scripts/load_seed_data.py`
-are still TODO stubs — they were designed for a different, not-yet-needed SQLite/JSON
-path and are now superseded by `ingestion/` + `filter_engine.py`. The `frontend/`
-React scaffold (Vite/TSX) is also still unimplemented; the MVP's plain HTML/JS page in
-`backend/app/static/` replaces it for now.
+Not working: `backend/scripts/load_seed_data.py` is still a TODO stub — it was designed
+for a different, not-yet-needed SQLite/JSON path and is now superseded by `ingestion/`
++ `filter_engine.py`. The old `backend/app/db/` ORM-model stub package has been removed
+outright (it was empty/unused and collided on import with the new `backend/app/db.py`,
+which now backs the favorites/organizations endpoints — see below).
+
+**New architectural inconsistency, accepted for now, not resolved this pass:**
+`GET/POST/DELETE /favorites` and `GET /organizations` (`backend/app/db.py`,
+`backend/app/api/favorites.py`, `backend/app/api/organizations.py`) are the *first*
+endpoints to query Postgres (`raw.*`) directly, using the same table definitions
+`ingestion/db.py` populates. `GET /recommendations` still reads `data/sample/*.csv`
+directly and does not touch Postgres unless a `device_id` is supplied (in which case it
+does one extra lazy lookup against `raw.app_favorites` to populate `is_favorited` —
+deliberately not a FastAPI `Depends`, so that plain `/recommendations` calls still never
+require Docker/Postgres, preserving the CSV-only MVP demo path). So the API now
+straddles two data paths on purpose: recommendations from CSVs, favorites/organizations
+from Postgres. Unifying this (per "smallest next deliverable" below) would also resolve
+this split.
 
 ## Highest-risk issue
 
@@ -111,15 +148,31 @@ that logic. Not done yet; flagging the direction, not committing to it.
 
 - **No LLM calls yet.** Rule-based templates in `explain_engine.py` are enough to prove
   the "why it fits" concept.
-- **No React/Vite build.** The plain HTML/JS page in `backend/app/static/` is enough to
-  demonstrate the product loop; revisit `frontend/` only if a richer UI is needed.
-- **No user accounts or auth.** Not needed for a single-session recommendation tool.
+- ~~No React/Vite build.~~ **Reversed.** The Discover page's mockup (branded nav, hero
+  search, category filters, photo-card grid, organizations row, sidebar widgets) needed
+  real component/state complexity that a plain HTML/JS page couldn't reasonably carry.
+  `frontend/` (React + Vite + TS, no router/state library — still one screen) now
+  replaces the old static page as the default UI; the old page is preserved, not
+  deleted, at `backend/app/static/legacy/index.html`.
+- **No user accounts or auth.** Favorites use a client-generated anonymous `device_id`
+  (localStorage), not a login system — see above.
 - **No scraping/automation pipeline.** Principles #5 and #6 explicitly say start manual.
-- **No state management library or routing on the frontend.** One screen, one form, one
-  result list.
-- **No geocoding API for ZIP proximity.** A small, human-maintainable centroid table
-  (`data/sample/zip_centroids.csv`) is enough to rank "nearby vs. far" — routing-accurate
-  distance isn't the point.
+- **No state management library or routing on the frontend.** Still one screen —
+  Organizations/Favorites nav links are inert labels, not routed pages, this pass.
+- **No geocoding or routing API for ZIP proximity or transit time.** A small,
+  human-maintainable centroid table (`data/sample/zip_centroids.csv`) is enough to rank
+  "nearby vs. far" — routing-accurate distance isn't the point. The new
+  `estimated_transit_minutes` field (`presentation.py`) is likewise a documented,
+  fixed-assumed-speed (12 mph) estimate from that same haversine distance, labeled
+  `"~N min"` in the UI — not a real Google-Directions-style routing call, no API key
+  added.
+- **No external image hosting/generation.** `image_url` is a nullable passthrough
+  column (CSV → Postgres → API); no rows currently populate it, and the frontend falls
+  back to a CSS category-colored placeholder block when it's absent. Populating real
+  photo URLs is a manual curation task, not something this pass fabricates.
+- **No live weather API.** The sidebar's weather card is a static, explicitly-labeled
+  "Illustrative only, not a live forecast" card (`is_live: false` in the underlying
+  data) — no external key needed this pass.
 - **No learned/ML scoring model.** `scoring_engine.py` is a fixed set of simple,
   inspectable weighted components on purpose — transparency (principle #4) would be
   lost the moment ranking becomes a black box.

@@ -44,9 +44,9 @@ def load_activities() -> pd.DataFrame:
     events["solo_friendly"] = events["solo_friendly"].astype(str).str.lower() == "true"
 
     merged = events.merge(
-        sources[["source_id", "name", "last_checked", "channel_type", "update_cadence"]].rename(
-            columns={"name": "source_name", "last_checked": "source_last_checked"}
-        ),
+        sources[
+            ["source_id", "name", "last_checked", "channel_type", "update_cadence", "notes"]
+        ].rename(columns={"name": "source_name", "last_checked": "source_last_checked", "notes": "source_notes"}),
         on="source_id",
         how="left",
     )
@@ -78,6 +78,18 @@ def filter_activities(constraints: UserConstraints, now: Optional[datetime] = No
 
     if constraints.date is not None:
         df = df[df["start_time"].dt.date == constraints.date]
+
+    if constraints.after_time is not None:
+        df = df[df["start_time"].dt.time >= constraints.after_time]
+
+    if constraints.hours_free is not None:
+        # Only exclude events whose duration is known and exceeds the
+        # user's stated free time -- an unknown end_time is never treated
+        # as "too long", since that would fabricate a constraint violation.
+        known_duration = df["end_time"].notna()
+        duration_hours = (df["end_time"] - df["start_time"]).dt.total_seconds() / 3600
+        too_long = known_duration & (duration_hours > constraints.hours_free)
+        df = df[~too_long]
 
     return df
 

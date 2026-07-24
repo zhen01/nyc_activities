@@ -42,6 +42,10 @@ jobs:
         with:
           python-version: "3.11"
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
       - name: Install dependencies
         run: |
           pip install -r ingestion/requirements.txt
@@ -63,6 +67,12 @@ jobs:
       - name: pytest (backend)
         working-directory: backend
         run: python -m pytest tests
+
+      - name: frontend build (compile check)
+        working-directory: frontend
+        run: |
+          npm install
+          npm run build
 
       - name: Load fixture data (ingestion)
         run: python -m ingestion

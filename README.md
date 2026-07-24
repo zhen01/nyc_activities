@@ -68,15 +68,22 @@ being deliberately small and feasibility-first.
 - **dbt analytics mart** — a single `mart_activity_candidates` model that enforces every
   business rule (expired events, inactive sources, unknown-price-is-not-free, stale
   sources) in one place, with a singular SQL test per rule.
-- **CI on every PR** — lint (`ruff`, `sqlfluff`), two pytest suites, ingestion, and
-  `dbt build` all run against a real Postgres service container.
+- **React Discover page** — hero search (free time, date, after-time, "looking to"
+  intent), a category filter row, a photo-card grid, a "Discover hidden gems"
+  organizations row, and a sidebar (plan-at-a-glance, an explicitly-illustrative weather
+  card, a favorites summary).
+- **Server-persisted favorites** — heart-toggle any activity; persisted via
+  `GET/POST/DELETE /favorites`, scoped to an anonymous `device_id` (no login/auth).
+- **CI on every PR** — lint (`ruff`, `sqlfluff`), two pytest suites, a `frontend/`
+  build compile-check, ingestion, and `dbt build` all run against a real Postgres
+  service container.
 
 ## Tech Stack
 
 | Layer | Tools |
 |---|---|
 | API | FastAPI, Pydantic, Uvicorn |
-| Frontend | Plain HTML/JS (`backend/app/static/`) — no build step required |
+| Frontend | React + Vite + TypeScript (`frontend/`) — no router/state library, one screen |
 | Ingestion | Python, SQLAlchemy, psycopg, requests, pandas |
 | Database | PostgreSQL 16 (Docker Compose locally) |
 | Analytics | dbt (staging → intermediate → mart), sqlfluff |
@@ -102,7 +109,7 @@ scoring_engine.py  — transparent, inspectable ranking (proximity, vibe, source
 explain_engine.py  — "why this fits" + explicit uncertainty
       │
       ▼
-POST/GET /recommendations  →  static HTML/JS UI
+GET /recommendations  →  React Discover page (frontend/)
 ```
 
 Separately, `ingestion/` loads the same curated data (plus live NYC Parks events) into
@@ -123,12 +130,52 @@ make mvp
 # equivalent: cd backend && uvicorn app.main:app --reload --port 8000
 ```
 
-Open http://localhost:8000 in a browser, set constraints, and click "Find activities".
-Or query the API directly:
+Open http://localhost:8000 in a browser to use the built React Discover page directly
+from FastAPI's static mount. Or query the API directly:
 
 ```bash
-curl "http://localhost:8000/recommendations?category=sports&max_cost=15&solo_friendly=true"
+curl "http://localhost:8000/recommendations?category=active&max_cost=15&solo_friendly=true"
 ```
+
+### Frontend dev server (optional, for editing the UI)
+
+For live-reloading frontend development, run Vite and FastAPI side by side instead of
+using the built static bundle:
+
+```bash
+# terminal 1
+cd backend && uvicorn app.main:app --reload --port 8000
+
+# terminal 2
+cd frontend && npm install && npm run dev
+```
+
+Open http://localhost:5173 — `vite.config.ts` proxies `/recommendations`,
+`/organizations`, and `/favorites` to the FastAPI backend on port 8000, so the frontend
+code never hardcodes a base URL.
+
+To rebuild the static bundle FastAPI serves at `/` (what `make mvp` uses):
+
+```bash
+cd frontend && npm run build
+cp -r dist/* ../backend/app/static/
+```
+
+### Favorites (`GET/POST/DELETE /favorites`)
+
+Heart-toggling an activity persists it server-side in Postgres (`raw.app_favorites`),
+keyed by an anonymous `device_id` UUID the frontend generates and stores in
+`localStorage` — there's no login/auth system. This is the first API surface that
+requires Postgres to be running (`make db-up`); plain `/recommendations` calls (no
+`device_id`) still never touch it, preserving the CSV-only, Docker-free MVP demo path.
+
+### Organizations (`GET /organizations`)
+
+Powers the Discover page's "Discover hidden gems" row: active sources plus a count of
+their upcoming events, queried directly against `raw.activity_sources` /
+`raw.activity_events`. Like `/favorites`, this reads from Postgres directly rather than
+the CSV path `/recommendations` still uses — see [STATUS.md](STATUS.md) for why these
+two data paths currently coexist unresolved.
 
 ### Inputs and ranking behavior
 
@@ -162,21 +209,22 @@ checked relative to its own update cadence), `source_name`, `source_verified_dat
 
 | Path | Purpose |
 |---|---|
-| `backend/app/main.py` | FastAPI entrypoint |
-| `backend/app/api/` | HTTP routes (`POST /recommendations`) |
+| `backend/app/main.py` | FastAPI entrypoint (routers + CORS + static mount) |
+| `backend/app/api/` | HTTP routes: `recommendations.py`, `favorites.py`, `organizations.py` |
 | `backend/app/models/schema.py` | Request/response models (`UserConstraints`, `Recommendation`) |
 | `backend/app/services/filter_engine.py` | Feasibility filtering (excludes expired/incompatible events) — principle #1 |
 | `backend/app/services/scoring_engine.py` | Transparent ranking (proximity, vibe match, source confidence) |
 | `backend/app/services/geo.py` | ZIP centroid lookup + straight-line distance |
+| `backend/app/services/presentation.py` | Display-only derived fields for the Discover page: badges, tags, category labels, transit-time estimate |
 | `backend/app/services/explain_engine.py` | "Why this fits" explanation generation — principle #4 |
 | `data/sample/zip_centroids.csv` | Small curated NYC ZIP → lat/lon lookup table (no geocoding API) |
-| `backend/app/db/` | DB connection + ORM models (`Organization`, `Activity`, `Source`) |
+| `backend/app/db.py` | Postgres access for `favorites`/`organizations` (reuses `ingestion/db.py`'s table definitions) — see STATUS.md's noted CSV-vs-Postgres split |
 | `backend/data/sources.yaml` | Manually maintained directory of orgs/channels — principle #6 |
 | `backend/data/seed_activities.json` | Curated, human-verified activities actually served to users |
 | `backend/scripts/load_seed_data.py` | Loads seed data into the database |
-| `backend/tests/` | Unit tests, starting with the filter engine |
-| `backend/app/static/` | Minimal HTML/JS UI: one constraint form, one results list |
-| `frontend/src/` | React scaffold (unused for now — see STATUS.md) |
+| `backend/tests/` | Unit + API tests: filter/scoring engines, presentation, favorites, organizations |
+| `backend/app/static/` | Built React app (from `frontend/dist/`); prior plain HTML/JS page archived at `static/legacy/` |
+| `frontend/src/` | React + Vite + TS Discover page: `App.tsx`, `api/client.ts`, `components/` (`HeroSearch`, `CategoryFilterRow`, `ActivityCard`, `FavoriteButton`, `OrganizationRow`, `Sidebar`, ...) |
 | `docs/source_directory_guide.md` | How to add/maintain a source and promote it to a seed activity |
 | `ARCHITECTURE.md` | How data flows end to end |
 | `STATUS.md` | What currently works, the highest-risk issue, and the next deliverable |

@@ -92,7 +92,6 @@ scored as (
             when activity_category = 'culture' and has_creative_tag then 'creative'
             when has_social_tag then 'social'
             when has_chill_tag then 'chill'
-            else null
         end as secondary_badge,
 
         (

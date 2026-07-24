@@ -1,6 +1,16 @@
 /**
  * React entrypoint. Mounts <App /> into #root. No routing library --
- * this is a single-screen product (constraints form in, recommendations out).
+ * this is a single-screen product (Discover page: search in, activities out).
  */
 
-// TODO: createRoot(document.getElementById('root')).render(<App />)
+import { StrictMode } from "react";
+import { createRoot } from "react-dom/client";
+
+import App from "./App";
+import "./index.css";
+
+createRoot(document.getElementById("root")!).render(
+  <StrictMode>
+    <App />
+  </StrictMode>,
+);

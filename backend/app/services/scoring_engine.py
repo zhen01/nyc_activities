@@ -116,6 +116,12 @@ def score_row(row: pd.Series, constraints: UserConstraints, today: Optional[date
     """Compute the full transparent score breakdown for one candidate row."""
     distance_miles = compute_distance_miles(row, constraints.zip_code)
     desired_vibe = constraints.vibe if constraints.mode == "mood" else None
+    # intent="meet_people" reuses the existing vibe-match component rather
+    # than adding a new scoring dimension/weight -- "meet people" is
+    # treated as wanting the "social" vibe tag, same as mood mode's vibe
+    # matching. No new tunables in WEIGHTS.
+    if constraints.intent == "meet_people":
+        desired_vibe = "social"
 
     conf_score, conf_label, conf_reason = confidence_score(
         row["channel_type"], row["update_cadence"], row["source_last_checked"], today

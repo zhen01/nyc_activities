@@ -27,6 +27,13 @@ def build_explanation(row: pd.Series, constraints: UserConstraints) -> str:
     if constraints.date is not None:
         reasons.append(f"is happening on {row['start_time'].date()}")
 
+    if constraints.hours_free is not None:
+        reasons.append(f"fits within the {constraints.hours_free:g} hour(s) you have free")
+    if constraints.intent == "meet_people":
+        reasons.append("is a good fit for meeting people")
+    elif constraints.intent == "solo_time":
+        reasons.append("works well for solo time")
+
     if constraints.mode == "mood" and constraints.vibe:
         if row["vibe_score"] == 100.0:
             reasons.append(f"matches the '{constraints.vibe}' vibe you asked for")
