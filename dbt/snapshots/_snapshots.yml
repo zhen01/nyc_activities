@@ -1,0 +1,33 @@
+version: 2
+
+snapshots:
+  - name: snap_nyc_parks_events
+    description: >
+      SCD Type 2 change history for the NYC Parks feed -- the only place
+      this history exists. The source API serves a rolling 14-day window
+      with no history endpoint, and raw ingestion upserts on guid, so
+      without this snapshot every previous version of a record is destroyed
+      on the next run. Uses the `check` strategy over content columns;
+      `ingested_at` is deliberately excluded because it is rewritten on
+      every upsert and would manufacture a version per run.
+    columns:
+      - name: dbt_scd_id
+        description: Surrogate key, one per version of an event.
+        tests:
+          - unique
+          - not_null
+      - name: source_record_id
+        description: The API's guid. Not unique here -- one row per version per event.
+        tests:
+          - not_null
+      - name: title
+        description: >
+          The column that carries cancellations. The feed has no status
+          field; a cancelled event is republished with a "CANCELED:"
+          prefix, so a title change is the signal being tracked.
+      - name: dbt_valid_from
+        description: When this version was first captured by the pipeline (not when the publisher created it).
+        tests:
+          - not_null
+      - name: dbt_valid_to
+        description: When this version was superseded. NULL marks the current version.

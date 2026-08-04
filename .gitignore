@@ -2,8 +2,12 @@
 __pycache__/
 *.pyc
 .venv/
+# pre-uv environment, kept locally until the migration settles
+.venv-old-py39/
 venv/
 *.db
+.ruff_cache/
+.pytest_cache/
 
 # Node
 node_modules/

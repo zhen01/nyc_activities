@@ -15,83 +15,83 @@ from app.services.scoring_engine import confidence_score, proximity_score, vibe_
 NOW = datetime(2026, 7, 20, 12, 0, 0)
 
 
-def test_expired_events_are_excluded():
+def test_expired_events_are_excluded(sample_activities):
     constraints = UserConstraints(mode="specific")
-    df = filter_activities(constraints, now=NOW)
+    df = filter_activities(constraints, now=NOW, activities=sample_activities)
     assert "evt-009" not in df["event_id"].values, "evt-009 starts in the past and must be excluded"
 
 
-def test_category_is_a_hard_filter_in_specific_mode():
+def test_category_is_a_hard_filter_in_specific_mode(sample_activities):
     constraints = UserConstraints(mode="specific", category="active")
-    df = filter_activities(constraints, now=NOW)
+    df = filter_activities(constraints, now=NOW, activities=sample_activities)
     assert set(df["category"]) == {"active"}
 
 
-def test_category_is_not_a_hard_filter_in_mood_mode():
+def test_category_is_not_a_hard_filter_in_mood_mode(sample_activities):
     constraints = UserConstraints(mode="mood", vibe="chill")
-    df = filter_activities(constraints, now=NOW)
+    df = filter_activities(constraints, now=NOW, activities=sample_activities)
     assert len(set(df["category"])) > 1, "mood mode should not restrict to a single category"
 
 
-def test_max_cost_excludes_pricier_events():
+def test_max_cost_excludes_pricier_events(sample_activities):
     constraints = UserConstraints(mode="specific", max_cost=0)
-    df = filter_activities(constraints, now=NOW)
+    df = filter_activities(constraints, now=NOW, activities=sample_activities)
     assert (df["cost"] <= 0).all()
 
 
-def test_solo_friendly_hard_filter():
+def test_solo_friendly_hard_filter(sample_activities):
     constraints = UserConstraints(mode="specific", solo_friendly=True)
-    df = filter_activities(constraints, now=NOW)
+    df = filter_activities(constraints, now=NOW, activities=sample_activities)
     assert df["solo_friendly"].all()
 
 
-def test_specific_mode_never_returns_more_than_five():
+def test_specific_mode_never_returns_more_than_five(sample_activities):
     constraints = UserConstraints(mode="specific")
-    result = build_recommendations(constraints, now=NOW)
+    result = build_recommendations(constraints, now=NOW, activities=sample_activities)
     assert len(result) <= 5
 
 
-def test_specific_mode_is_ranked_by_total_score_descending():
+def test_specific_mode_is_ranked_by_total_score_descending(sample_activities):
     constraints = UserConstraints(mode="specific")
-    result = build_recommendations(constraints, now=NOW)
+    result = build_recommendations(constraints, now=NOW, activities=sample_activities)
     scores = list(result["total_score"])
     assert scores == sorted(scores, reverse=True)
 
 
-def test_zip_proximity_ranks_nearby_events_higher():
+def test_zip_proximity_ranks_nearby_events_higher(sample_activities):
     # ZIP 10003 (East Village) should rank the East Village open mic
     # (evt-005) above events on the far side of Brooklyn, all else equal.
     constraints = UserConstraints(mode="mood", vibe="social", zip_code="10003")
-    result = build_recommendations(constraints, now=NOW)
+    result = build_recommendations(constraints, now=NOW, activities=sample_activities)
     assert "distance_miles" in result.columns
     nearby = result[result["event_id"] == "evt-005"]
     assert not nearby.empty
     assert nearby.iloc[0]["distance_miles"] < 1.0
 
 
-def test_unknown_zip_does_not_crash_and_drops_proximity_component():
+def test_unknown_zip_does_not_crash_and_drops_proximity_component(sample_activities):
     constraints = UserConstraints(mode="specific", zip_code="99999")
-    result = build_recommendations(constraints, now=NOW)
+    result = build_recommendations(constraints, now=NOW, activities=sample_activities)
     assert result["distance_miles"].isna().all()
 
 
-def test_mood_mode_prefers_matching_vibe_tag():
+def test_mood_mode_prefers_matching_vibe_tag(sample_activities):
     constraints = UserConstraints(mode="mood", vibe="creative")
-    result = build_recommendations(constraints, now=NOW)
+    result = build_recommendations(constraints, now=NOW, activities=sample_activities)
     assert result.iloc[0]["vibe_score"] == 100.0
 
 
-def test_surprise_mode_respects_hard_constraints_and_returns_up_to_five():
+def test_surprise_mode_respects_hard_constraints_and_returns_up_to_five(sample_activities):
     constraints = UserConstraints(mode="surprise", max_cost=0)
-    result = build_recommendations(constraints, now=NOW, random_state=42)
+    result = build_recommendations(constraints, now=NOW, activities=sample_activities, random_state=42)
     assert len(result) <= 5
     assert (result["cost"] <= 0).all()
 
 
-def test_surprise_mode_sampling_is_reproducible_with_same_seed():
+def test_surprise_mode_sampling_is_reproducible_with_same_seed(sample_activities):
     constraints = UserConstraints(mode="surprise")
-    first = build_recommendations(constraints, now=NOW, random_state=7)
-    second = build_recommendations(constraints, now=NOW, random_state=7)
+    first = build_recommendations(constraints, now=NOW, activities=sample_activities, random_state=7)
+    second = build_recommendations(constraints, now=NOW, activities=sample_activities, random_state=7)
     assert list(first["event_id"]) == list(second["event_id"])
 
 
@@ -128,15 +128,15 @@ def test_proximity_score_decreases_with_distance():
     assert close > far
 
 
-def test_hours_free_excludes_events_longer_than_stated_free_time():
+def test_hours_free_excludes_events_longer_than_stated_free_time(sample_activities):
     constraints = UserConstraints(mode="specific", hours_free=1.0)
-    df = filter_activities(constraints, now=NOW)
+    df = filter_activities(constraints, now=NOW, activities=sample_activities)
     assert "evt-001" not in df["event_id"].values, "2-hour event exceeds 1 hour free"
     assert "evt-010" in df["event_id"].values, "1-hour event fits exactly"
 
 
-def test_after_time_excludes_earlier_start_times():
+def test_after_time_excludes_earlier_start_times(sample_activities):
     constraints = UserConstraints(mode="specific", after_time=time(15, 0))
-    df = filter_activities(constraints, now=NOW)
+    df = filter_activities(constraints, now=NOW, activities=sample_activities)
     assert "evt-002" not in df["event_id"].values, "starts at 09:00, before 15:00"
     assert "evt-001" in df["event_id"].values, "starts at 18:30, after 15:00"

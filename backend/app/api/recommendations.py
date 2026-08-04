@@ -87,11 +87,14 @@ def get_recommendations(
             end_time=row["end_time"] if pd.notna(row["end_time"]) else None,
             cost=row["cost"] if pd.notna(row["cost"]) else None,
             location=row["location"],
-            solo_friendly=row["solo_friendly"],
+            solo_friendly=bool(row["solo_friendly"]) if pd.notna(row["solo_friendly"]) else None,
             source_url=row["source_url"] if pd.notna(row["source_url"]) else None,
             source_name=row["source_name"],
             source_verified_date=row["source_last_checked"],
-            distance_miles=row["distance_miles"],
+            # None round-trips through a float DataFrame column as NaN,
+            # which is not JSON-serialisable -- so this needs pd.notna, not
+            # an `is None` check.
+            distance_miles=row["distance_miles"] if pd.notna(row["distance_miles"]) else None,
             confidence_label=row["confidence_label"],
             confidence_score=row["confidence_score"],
             score=row["total_score"],

@@ -16,6 +16,7 @@ from ingestion.nyc_parks import (
     NycParksRecordError,
     build_table,
     fetch_events,
+    parse_coordinates,
     parse_event_date,
     parse_record,
     parse_records,
@@ -36,6 +37,7 @@ SAMPLE_RECORD = {
     "location": "Soldiers' and Sailors' Monument (in Riverside Park)",
     "categories": "Fitness | Outdoor Fitness",
     "registration_url": {"url": "https://example.org/register"},
+    "coordinates": "40.79892349243164000, -73.97216796875000000",
     "pubdate": "2026-07-19 00:00:05",
 }
 
@@ -70,6 +72,46 @@ def test_parse_record_extracts_expected_fields():
     assert row["registration_url"] == "https://example.org/register"
     assert row["raw_payload"] == SAMPLE_RECORD
     assert row["ingested_at"] is not None
+    assert row["lat"] == pytest.approx(40.798923, abs=1e-5)
+    assert row["lon"] == pytest.approx(-73.972168, abs=1e-5)
+    assert row["description"] == "Join us for Tai Chi."
+
+
+# --- coordinate parsing ------------------------------------------------------
+
+
+def test_parse_coordinates_splits_lat_and_lon():
+    lat, lon = parse_coordinates("40.62894289677700000, -73.89599752426100000")
+    assert lat == pytest.approx(40.628943, abs=1e-5)
+    assert lon == pytest.approx(-73.895998, abs=1e-5)
+
+
+@pytest.mark.parametrize("value", [None, "", "   ", 12345, "40.6", "not,numbers"])
+def test_parse_coordinates_returns_none_pair_for_unusable_values(value):
+    # A missing location is an acceptable state (it only disables proximity
+    # ranking), so this must never raise the way a bad guid/date does.
+    assert parse_coordinates(value) == (None, None)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "0.0, 0.0",  # null island
+        "51.5074, -0.1278",  # London
+        "40.7128, -122.4194",  # plausible lat, west-coast lon
+    ],
+)
+def test_parse_coordinates_rejects_points_outside_nyc(value):
+    # A garbage coordinate that silently ranks an event as "nearby" is worse
+    # than having no coordinate at all.
+    assert parse_coordinates(value) == (None, None)
+
+
+def test_parse_record_tolerates_missing_coordinates():
+    record = {k: v for k, v in SAMPLE_RECORD.items() if k != "coordinates"}
+    row = parse_record(record)
+    assert row["lat"] is None
+    assert row["lon"] is None
 
 
 # --- empty API response ------------------------------------------------------

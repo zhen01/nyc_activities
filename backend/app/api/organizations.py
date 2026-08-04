@@ -1,25 +1,29 @@
 """GET /organizations -- data for the Discover page's "Discover hidden
-gems" row: active sources plus a count of their upcoming (not-yet-started)
-events. Queries Postgres directly via SQLAlchemy Core against the same
-table definitions ingestion/db.py uses, rather than the CSV-backed MVP
-pipeline in filter_engine.py -- see app/db.py and STATUS.md for why these
-two data paths currently coexist.
+gems" row: active sources plus how many recommendable events each one
+currently has.
+
+Reads `analytics.mart_organizations` rather than counting the raw event
+table. That matters for correctness, not just tidiness: a raw count applies
+none of the business rules, so it would advertise organizations on the
+strength of events that are cancelled, expired, or from a source stale
+enough to be excluded. It also lets machine-ingested feeds appear here at
+all -- the raw source directory only contains hand-curated organizations.
 """
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
-from sqlalchemy import func, select
+from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
-from app.db import get_engine, schema_for
-from ingestion.db import build_metadata
+from app.db import get_engine
 
 router = APIRouter()
+
+MART_RELATION = "analytics.mart_organizations"
 
 
 class Organization(BaseModel):
@@ -34,32 +38,20 @@ class Organization(BaseModel):
 
 @router.get("/organizations", response_model=List[Organization])
 def list_organizations(engine: Engine = Depends(get_engine)) -> List[Organization]:
-    _, sources, events = build_metadata(schema=schema_for(engine))
-
-    upcoming_counts = (
-        select(events.c.source_id, func.count().label("upcoming_event_count"))
-        .where(events.c.start_time >= datetime.now(timezone.utc).replace(tzinfo=None))
-        .group_by(events.c.source_id)
-        .subquery()
+    stmt = text(
+        f"""
+        select
+            source_id,
+            source_name as name,
+            source_category as category,
+            channel_type,
+            source_url as url,
+            source_image_url as image_url,
+            upcoming_event_count
+        from {MART_RELATION}
+        order by upcoming_event_count desc, source_name
+        """
     )
-
-    stmt = (
-        select(
-            sources.c.source_id,
-            sources.c.name,
-            sources.c.category,
-            sources.c.channel_type,
-            sources.c.url,
-            sources.c.image_url,
-            func.coalesce(upcoming_counts.c.upcoming_event_count, 0).label("upcoming_event_count"),
-        )
-        .select_from(
-            sources.outerjoin(upcoming_counts, sources.c.source_id == upcoming_counts.c.source_id)
-        )
-        .where(sources.c.is_active.is_(True))
-        .order_by(func.coalesce(upcoming_counts.c.upcoming_event_count, 0).desc())
-    )
-
     with engine.begin() as conn:
         rows = conn.execute(stmt).mappings().all()
     return [Organization(**row) for row in rows]

@@ -3,12 +3,13 @@ labels, short descriptive badges/tags, and a documented distance-to-time
 estimate.
 
 Purely derived, display-only logic computed from fields already present on
-a scored row (vibe_tags, solo_friendly, category, source notes) -- no new
-data is fabricated. This mirrors the equivalent logic in
-dbt/models/intermediate/int_activity_enriched.sql (activity_family /
-secondary_badge / beginner_friendly), duplicated here because
-/recommendations still reads the CSVs directly rather than the dbt mart
-(see STATUS.md).
+a scored row (vibe_tags, solo_friendly, category) -- no new data is
+fabricated.
+
+`beginner_friendly` is no longer re-derived here: it is computed once in
+dbt/models/intermediate/int_activity_enriched.sql and read straight off the
+mart row, so the two layers can no longer disagree. The local keyword
+heuristic remains only as a fallback for rows that predate that column.
 """
 
 from __future__ import annotations
@@ -68,15 +69,24 @@ def compute_badges(row: pd.Series) -> List[str]:
     return badges
 
 
+def _is_beginner_friendly(row: pd.Series) -> bool:
+    """Prefer the value the analytics layer already computed; fall back to
+    the original keyword heuristic only when that column is absent.
+    """
+    precomputed = row.get("beginner_friendly")
+    if precomputed is not None and not pd.isna(precomputed):
+        return bool(precomputed)
+    haystack = f"{row.get('source_notes') or ''} {row.get('title') or ''}".lower()
+    return "beginner" in haystack
+
+
 def compute_tags(row: pd.Series) -> List[str]:
     """Short descriptive pills shown on each card."""
     tags = _vibe_tags(row)
-    notes = str(row.get("source_notes") or "").lower()
-    title = str(row.get("title") or "").lower()
     category = str(row["category"]).lower()
 
     result: List[str] = []
-    if "beginner" in notes or "beginner" in title:
+    if _is_beginner_friendly(row):
         result.append("Beginner friendly")
     if row.get("solo_friendly") and "solo_focus" in tags:
         result.append("Great for solo")
@@ -95,7 +105,7 @@ def estimate_transit_minutes(
     """Estimated (not routed) transit time in minutes. Returns None when
     distance is unknown -- never fabricates a time.
     """
-    if distance_miles is None:
+    if distance_miles is None or pd.isna(distance_miles):
         return None
     return round((distance_miles / mph) * 60)
 

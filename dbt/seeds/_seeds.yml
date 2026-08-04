@@ -1,0 +1,22 @@
+version: 2
+
+seeds:
+  - name: zip_centroids
+    description: >
+      Small, human-maintained NYC ZIP -> (lat, lon, borough) lookup table.
+      Deliberately not a geocoding API call -- see STATUS.md's
+      "Unnecessary complexity to avoid" section. Used to join a borough
+      onto each event in int_activity_enriched, and (in the live API) to
+      compute straight-line ZIP proximity for ranking.
+    columns:
+      - name: zip_code
+        description: 5-digit NYC ZIP code.
+        tests:
+          - unique
+          - not_null
+      - name: lat
+        description: Approximate centroid latitude for the ZIP.
+      - name: lon
+        description: Approximate centroid longitude for the ZIP.
+      - name: borough
+        description: NYC borough the ZIP falls in.

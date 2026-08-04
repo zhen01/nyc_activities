@@ -3,34 +3,174 @@ version: 2
 sources:
   - name: raw
     schema: raw
-    description: Bronze-layer tables loaded verbatim by ingestion/db.py.
+    description: >
+      Bronze-layer tables loaded verbatim by ingestion/db.py from
+      data/sample/*.csv, upserted on their natural key so reruns never
+      duplicate rows. No business logic or renaming happens at this layer.
     tables:
       - name: activity_sources
+        description: >
+          One row per organization/channel a human curator has added to
+          the source directory (see backend/data/sources.yaml). The
+          directory of *sources* is separate from the *events* they
+          publish -- a source can have zero, one, or many upcoming events.
         columns:
           - name: source_id
+            description: Natural-key identifier, e.g. "nyc-social-sports-league".
             tests:
               - unique
               - not_null
+          - name: name
+            description: Human-readable organization/channel name.
+          - name: category
+            description: >
+              The source's primary activity category, from the 7-value
+              taxonomy (active/outdoors/social/culture/food_drink/learn/
+              volunteer).
+          - name: channel_type
+            description: How this source publishes its events (website, meetup, instagram).
+          - name: url
+            description: Canonical URL for the source itself (not a specific event).
+          - name: update_cadence
+            description: >
+              How often the curator expects to need to re-check this
+              source for new/changed events (daily/weekly/seasonal). Drives
+              freshness_status downstream -- see the freshness_status doc
+              on int_activity_enriched.
+          - name: last_checked
+            description: Date a human curator last manually verified this source.
+          - name: notes
+            description: Free-text curator notes (also used to detect "beginner friendly" language downstream).
           - name: is_active
+            description: >
+              Whether the curator still considers this source live. False
+              sources are excluded from the mart entirely, not just
+              deprioritized -- see assert_no_inactive_source_events_in_mart.sql.
             tests:
               - not_null
+          - name: image_url
+            description: Optional source logo/photo URL. Nullable -- not populated in the sample dataset yet.
       - name: activity_events
+        description: One row per curated, human-verified upcoming activity.
         columns:
           - name: event_id
+            description: Natural-key identifier, e.g. "evt-001".
             tests:
               - unique
               - not_null
           - name: source_id
+            description: Foreign key to activity_sources.
             tests:
               - not_null
               - relationships:
                   arguments:
                     to: source('raw', 'activity_sources')
                     field: source_id
+          - name: title
+            description: Event display name.
+          - name: category
+            description: >
+              The event's category from the 7-value taxonomy -- can differ
+              from its source's category (a source can host events across
+              multiple categories).
+          - name: start_time
+            description: Event start timestamp. Used to exclude expired events downstream.
+          - name: end_time
+            description: Event end timestamp. Nullable -- an unknown end time is never treated as "too long."
+          - name: cost
+            description: >
+              Event price in USD. Nullable, and deliberately never
+              coalesced to 0 anywhere downstream -- an unknown price must
+              not be treated as free. See
+              tests/assert_unknown_price_stays_null.sql.
+          - name: location
+            description: Free-text venue/location description.
+          - name: solo_friendly
+            description: Whether a solo attendee can reasonably join. Drives the audience-fit scores downstream.
+          - name: source_url
+            description: URL for this specific event (registration/details page), distinct from the source's own URL.
+          - name: last_checked
+            description: Date a human curator last manually verified this specific event.
+          - name: zip_code
+            description: NYC ZIP code, joined against the zip_centroids seed for borough + proximity.
+          - name: lat
+            description: Latitude, redundant with the zip_centroids seed join but kept for direct use.
+          - name: lon
+            description: Longitude, redundant with the zip_centroids seed join but kept for direct use.
+          - name: vibe_tags
+            description: >
+              Comma-separated free-text tags (e.g. "social,energetic")
+              used to compute the has_*_tag flags and audience-fit scores
+              downstream. Not a controlled vocabulary.
+          - name: image_url
+            description: Optional event photo URL. Nullable -- not populated in the sample dataset yet.
+      - name: nyc_parks_events
+        description: >
+          Live NYC Parks public events for the upcoming 14 days, fetched
+          from the NYC Open Data Socrata API by ingestion/nyc_parks.py and
+          upserted on the API's guid. Bronze layer: fields are stored as
+          the API returns them, with no business normalization -- the
+          categories string is not mapped, the bogus date component on
+          starttime/endtime is not corrected, and cancelled events are not
+          filtered. All of that happens in stg_nyc_parks_events.
+        columns:
+          - name: source_record_id
+            description: The API's `guid`, used as the upsert key.
+            tests:
+              - unique
+              - not_null
+          - name: title
+            description: Event title. Cancelled events are published with a "CANCELED:" prefix rather than a status field.
+          - name: startdate
+            description: The real calendar date the event happens. Trustworthy, unlike starttime's date component.
+          - name: enddate
+            description: End date for multi-day events. Usually equal to startdate.
+          - name: starttime
+            description: >
+              Stored as text. Only the time-of-day portion is meaningful --
+              the date component is the feed's publication date, not the
+              event's date. See stg_nyc_parks_events.
+          - name: endtime
+            description: Same caveat as starttime.
+          - name: location
+            description: Free-text venue. Can be empty, in which case parknames is the better label.
+          - name: parknames
+            description: Park name(s). Empty for ~28% of rows (events at non-park facilities).
+          - name: categories
+            description: >
+              Pipe-delimited multi-value category string, 28 distinct values
+              in the live feed. Mixes true activity types with audience
+              modifiers (Best for Kids, Seniors) and delivery format
+              (Virtual/Online Events).
+          - name: link_url
+            description: Event detail page on nycgovparks.org. Populated for every row observed.
+          - name: registration_url
+            description: Optional registration link. Present on ~72% of rows.
+          - name: lat
+            description: >
+              Parsed from the API's `coordinates` string by
+              ingestion/nyc_parks.py. Null when absent or outside NYC
+              bounds -- a wrong coordinate is worse than none, since it
+              would rank an event as falsely nearby.
+          - name: lon
+            description: See lat.
+          - name: description
+            description: Free-text event description (contains HTML entities).
+          - name: raw_payload
+            description: The complete original API record, retained so no field is lost by the column projection above.
+          - name: ingested_at
+            description: >
+              When this pipeline last wrote the row. Doubles as the
+              "last verified" signal for the synthetic API source, since
+              there is no human curation step -- see stg_nyc_parks_source.
 
 models:
   - name: stg_activity_sources
-    description: Cleaned/renamed activity_sources, one row per source.
+    description: >
+      Renaming-only view over raw.activity_sources -- one row per source,
+      no filtering or derived columns yet. Exists so every downstream
+      model reads consistent, English-readable column names instead of
+      the raw table's names.
     columns:
       - name: source_id
         tests:
@@ -43,7 +183,9 @@ models:
                 values: ['website', 'meetup', 'instagram']
 
   - name: stg_activity_events
-    description: Cleaned/renamed activity_events, one row per event.
+    description: >
+      Renaming-only view over raw.activity_events -- one row per event, no
+      filtering or derived columns yet.
     columns:
       - name: event_id
         tests:
@@ -52,3 +194,71 @@ models:
       - name: source_id
         tests:
           - not_null
+
+  - name: stg_nyc_parks_events
+    description: >
+      The live NYC Parks feed reshaped to match the curated event contract
+      so the two can be unioned. Deliberately not rename-only: it rebuilds
+      usable timestamps from a feed whose time fields carry a bogus date,
+      maps a 28-value pipe-delimited category string onto this project's
+      taxonomy by priority, and flags cancelled/virtual events. Fields the
+      feed does not publish (price, solo_friendly, vibe_tags) stay NULL
+      rather than being defaulted.
+    columns:
+      - name: event_id
+        description: The API guid namespaced with a "parks-" prefix so it cannot collide with a curated event_id.
+        tests:
+          - unique
+          - not_null
+      - name: source_id
+        description: Always the synthetic NYC Parks source -- see stg_nyc_parks_source.
+        tests:
+          - not_null
+      - name: activity_category
+        description: >
+          Mapped from the feed's multi-value categories string by priority
+          (volunteer > food_drink > outdoors > learn > culture > active).
+          NULL when nothing matched, which excludes the row from the mart
+          via the existing not-null structural rule rather than guessing a
+          bucket.
+        tests:
+          - accepted_values:
+              arguments:
+                values: ['active', 'outdoors', 'social', 'culture', 'food_drink', 'learn', 'volunteer']
+      - name: start_at
+        description: Rebuilt as startdate + the time-of-day portion of starttime.
+        tests:
+          - not_null
+      - name: end_at
+        description: >
+          Rebuilt as coalesce(enddate, startdate) + endtime's time-of-day.
+          NULL when that would land before start_at (contradictory source
+          data), rather than guessing a midnight rollover.
+      - name: price_amount
+        description: Always NULL -- this feed publishes no price. Unknown, not free.
+      - name: is_cancelled
+        description: True when the title carries a CANCELED/CANCELLED prefix, the feed's only cancellation signal.
+        tests:
+          - not_null
+      - name: is_virtual
+        description: True for online-only events, which have no meaningful physical proximity.
+        tests:
+          - not_null
+
+  - name: stg_nyc_parks_source
+    description: >
+      A single synthetic source row representing the NYC Parks Open Data
+      API itself, so freshness/confidence/discovery logic written against
+      the curated source directory applies to API events unchanged.
+      source_last_checked is derived from max(ingested_at), so a pipeline
+      that stops running decays in freshness instead of staying "fresh".
+    columns:
+      - name: source_id
+        tests:
+          - unique
+          - not_null
+      - name: channel_type
+        tests:
+          - accepted_values:
+              arguments:
+                values: ['api']

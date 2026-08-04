@@ -3,80 +3,110 @@
 ## Components
 
 - **Source directory (offline, human-maintained)** — `backend/data/sources.yaml`
-- **Curated sample data** — `data/sample/*.csv` (events + sources; read directly by the
-  MVP, and separately loaded into Postgres by `ingestion/`)
-- **Ingestion + raw database** — `ingestion/` loads CSVs (plus live NYC Parks events)
-  into Postgres's `raw` schema; `backend/app/db.py` reuses those same table definitions
-  for the favorites/organizations endpoints (see below)
-- **Analytics mart** — `dbt/` builds `analytics.mart_activity_candidates` on top of
-  `raw.*`, enforcing every business rule in one place (not yet consumed by the API)
-- **API** — FastAPI (`backend/app/`)
+- **Curated sample data** — `data/sample/*.csv`, ingested into `raw.*`; also reused as
+  the deterministic pytest fixture in `backend/tests/conftest.py`
+- **Live external feed** — NYC Parks events from the NYC Open Data Socrata API, a
+  rolling 14-day window, ingested by `ingestion/nyc_parks.py`
+- **Ingestion + raw database** — `ingestion/` loads both feeds into Postgres's `raw`
+  schema, upserting on each feed's natural key
+- **Analytics marts** — `dbt/` builds `mart_activity_candidates` (business rules
+  enforced once) and `mart_organizations` (sources + recommendable-event counts)
+- **API** — FastAPI (`backend/app/`), reading the marts
 - **Frontend** — React + Vite + TS Discover page (`frontend/src/`), built and served
   from `backend/app/static/`
 
 ## End-to-end flow (recommendations)
 
 ```
-data/sample/sources.csv, events.csv (curated, human-verified)
-      │
-      ▼
-filter_engine.py   — hard constraints only (feasibility before attractiveness)
-      │  small candidate set
-      ▼
-scoring_engine.py  — transparent, inspectable ranking (proximity, vibe, source confidence)
-      │
-      ▼
+data/sample/*.csv          NYC Open Data Socrata API (live, 14-day window)
+      │                              │
+      │ ingestion/ingest.py          │ ingestion/nyc_parks.py
+      ▼                              ▼
+raw.activity_sources/_events   raw.nyc_parks_events
+      │                              │
+      ▼ stg_activity_*               ▼ stg_nyc_parks_*   (reshape + data-quality fixes)
+      └───────────────┬──────────────┘  union
+                      ▼
+        int_activity_enriched  — freshness, discovery/actionability, audience fit
+                      ▼
+        mart_activity_candidates  — every business rule enforced once
+                      ▼
+filter_engine.py   — the user's own constraints only
+                      ▼
+scoring_engine.py  — transparent ranking (proximity, vibe, source confidence)
+                      ▼
 explain_engine.py  — "why this fits" + explicit uncertainty
-      │
-      ▼
-presentation.py    — display-only derived fields (badges, tags, category label, transit estimate)
-      │
-      ▼
+                      ▼
+presentation.py    — display-only fields (badges, tags, transit estimate)
+                      ▼
 GET /recommendations  (app/api/recommendations.py)
-      │  if device_id supplied: one lazy lookup against raw.app_favorites for is_favorited
+      │  if device_id supplied: one lazy lookup against raw.app_favorites
       ▼
-React Discover page (frontend/src/App.tsx) — HeroSearch + CategoryFilterRow request params
-      │
-      ▼
-ActivityCard (+ FavoriteButton) — renders each recommendation + explanation + uncertainty
+React Discover page (frontend/src/App.tsx)
 ```
 
-`GET /recommendations` reads `data/sample/*.csv` directly — it does not read from
-Postgres, even though `ingestion/` populates the same data there. This is deliberate,
-not an oversight (see STATUS.md's "smallest next deliverable"): the CSV path is the
-fastest way to demo the product loop without requiring Docker.
+## Why the API reads the mart, not the raw tables
 
-## End-to-end flow (favorites, organizations)
+Every business rule — expired, inactive source, abandoned freshness, missing URL,
+unknown-price-is-not-free, cancelled — is enforced once in
+`mart_activity_candidates`, with a singular dbt test per rule. `filter_engine.py`
+therefore applies only the constraints belonging to a specific request (category,
+budget, solo, date, hours free). Before this, the same rules existed in both SQL and
+Python and could drift apart silently.
+
+`GET /organizations` reads `mart_organizations` for the same reason: counting
+`raw.activity_events` directly applies none of those rules, so it would advertise an
+organization on the strength of cancelled or expired events.
 
 ```
 device_id (client-generated UUID, localStorage)
       │
       ▼
 POST /favorites {device_id, event_id}  ──┐
-GET  /favorites?device_id=              ├──►  raw.app_favorites  (backend/app/db.py)
-DELETE /favorites/{device_id}/{event_id}─┘         ▲
-                                                     │ reuses table defs from
-GET /organizations  ─────────────────────►  raw.activity_sources / raw.activity_events
-                                              (backend/app/db.py + ingestion/db.py)
+GET  /favorites?device_id=               ├──►  raw.app_favorites  (backend/app/db.py)
+DELETE /favorites/{device_id}/{event_id}─┘
 ```
 
-Unlike `/recommendations`, `/favorites` and `/organizations` query Postgres's `raw`
-schema directly via SQLAlchemy Core, reusing the same table definitions
-`ingestion/db.py` uses to populate it. This is a **named, accepted architectural
-inconsistency**, not resolved this pass: the API now has two coexisting data paths
-(CSV for recommendations, Postgres for favorites/organizations). See STATUS.md for the
-reasoning and the direction that would eventually unify them (pointing
-`filter_engine.py` at Postgres, likely at `analytics.mart_activity_candidates` rather
-than the raw tables).
+Favorites remain in `raw` rather than the analytics layer deliberately: they are
+application state written by user actions, not modeled analytics derived from a source
+feed. dbt owns the read models; the app owns its own writes.
+
+## Two feeds, one contract
+
+The curated CSV directory and the NYC Parks API are unioned in
+`int_activity_enriched` rather than modeled separately, because every enrichment
+applies identically to both. What differs is how much each feed publishes, and that is
+expressed as `NULL`s rather than as branching logic — the API feed carries no price, no
+`solo_friendly` flag and no vibe tags.
+
+Two consequences are load-bearing:
+
+- **`NULL` means unknown, never a default.** An unknown price never satisfies a budget
+  filter; unknown solo-friendliness never satisfies a solo-friendly request; and the
+  audience-fit scores are `NULL` rather than computed, because scoring them from absent
+  inputs would produce a confident-looking number derived from nothing.
+- **The API is modeled as a source.** It has no row in the hand-curated source
+  directory, so `stg_nyc_parks_source` synthesizes one, with `source_last_checked`
+  derived from `max(ingested_at)`. All the existing freshness/confidence/discovery
+  logic then applies unchanged — and a pipeline that silently stops running decays in
+  freshness instead of staying permanently "fresh".
+
+## Time is evaluated in NYC, not UTC
+
+`macros/nyc_time.sql` provides `nyc_now()`/`nyc_today()`, used by every model and test
+that reasons about "now". The warehouse runs in UTC; the product is entirely
+NYC-local. Using bare `current_timestamp` meant that between 8pm and midnight EDT, UTC
+had already rolled over and that evening's remaining events were excluded as
+"expired" — a real bug, caught with 15 events affected.
 
 ## Why data enters this way
 
-Nothing is scraped or generated live. The only way an activity reaches a user is:
-someone manually finds a source → manually verifies an activity from it → it gets
-written into `data/sample/events.csv` (or, longer-term, `sources.yaml` +
-`seed_activities.json`) with a `source_url` and `last_checked` date. This is
-intentional (principles #2, #5, #6): prove the recommendation logic is useful on a
-small, trustworthy dataset before ever considering scraping or automated ingestion.
+Nothing is scraped or invented. An activity reaches a user by exactly one of two
+routes: a curator manually finds and verifies it and writes it into
+`data/sample/events.csv` with a `source_url` and `last_checked` date, or it comes from
+a publisher's own official API. Both are attributable to a named, checkable source
+(principles #2, #5, #6) — which is what makes "discovery without hallucination"
+enforceable rather than aspirational. Scraping is still explicitly out of scope.
 The same principle applies to the frontend's presentation-layer additions — badges,
 tags, images, weather, and transit time are either derived from fields already backed
 by real data, or (images, weather) explicitly absent/labeled-illustrative rather than

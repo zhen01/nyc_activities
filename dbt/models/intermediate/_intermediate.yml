@@ -1,0 +1,145 @@
+version: 2
+
+models:
+  - name: int_parks_event_lifecycle
+    description: >
+      One row per event, summarising every version the snapshot has
+      captured: first sighting, change count, cancellation state, and --
+      only where the transition was actually observed -- how much notice a
+      cancellation gave. Deliberately refuses to compute a lead time for
+      events that were already cancelled at first capture, since that number
+      would describe when this pipeline started collecting rather than
+      anything about the publisher.
+    columns:
+      - name: event_id
+        description: Namespaced event key, matching mart_activity_candidates.
+        tests:
+          - unique
+          - not_null
+      - name: source_record_id
+        description: The API's guid.
+        tests:
+          - unique
+          - not_null
+      - name: first_captured_at
+        description: >
+          When this pipeline first saw the event. Explicitly NOT when the
+          publisher created or posted it -- that is not knowable from this
+          feed, and the column is named to prevent the confusion.
+        tests:
+          - not_null
+      - name: version_count
+        description: Number of distinct versions captured. 1 means nothing has changed since first capture.
+        tests:
+          - not_null
+      - name: is_cancelled_now
+        description: Whether the current version carries a cancellation prefix.
+        tests:
+          - not_null
+      - name: was_cancelled_at_first_capture
+        description: >
+          Whether the event was already cancelled the first time we saw it.
+          These are the left-censored cases whose cancellation timing is
+          unknowable.
+        tests:
+          - not_null
+      - name: cancellation_observed
+        description: >
+          True only when the live-to-cancelled transition happened inside the
+          observation window. The correct denominator for any cancellation
+          rate, and the precondition for cancellation_lead_hours being
+          populated.
+        tests:
+          - not_null
+      - name: cancellation_lead_hours
+        description: >
+          Hours between first seeing the cancellation and the event's
+          scheduled start. NULL when unknowable or not applicable. Negative
+          values are legitimate -- the feed sometimes marks events cancelled
+          after their start time.
+      - name: was_rescheduled
+        description: Whether the scheduled date or time changed across versions.
+      - name: was_relocated
+        description: Whether the location changed across versions.
+
+  - name: int_activity_enriched
+    description: >
+      Joins staging events + sources + the zip_centroids seed, then
+      computes every derived field the mart needs: freshness, discovery/
+      actionability scores, the four audience-fit scores and their
+      group_suitability/social_structure summaries, and the display-only
+      activity_family/secondary_badge labels. One row per event, same
+      grain as stg_activity_events -- this model adds columns, it never
+      changes the grain.
+    columns:
+      - name: event_id
+        description: Primary key, passed through unchanged from staging.
+        tests:
+          - unique
+          - not_null
+      - name: source_id
+        description: Foreign key to stg_activity_sources.
+        tests:
+          - not_null
+      - name: activity_category
+        description: The 7-value display taxonomy category, passed through from staging.
+      - name: activity_family
+        description: '{{ doc("activity_family") }}'
+      - name: secondary_badge
+        description: '{{ doc("secondary_badge") }}'
+      - name: is_active
+        description: Passed through from the source -- false sources are filtered out in the mart, not here.
+      - name: freshness_status
+        description: '{{ doc("freshness_status") }}'
+        tests:
+          - accepted_values:
+              arguments:
+                values: ['fresh', 'stale', 'abandoned']
+      - name: beginner_friendly
+        description: >
+          True if the source's curator notes or the event title contain
+          the word "beginner" (case-insensitive substring match). A simple
+          heuristic, not an ML classification -- deliberately transparent
+          about its own limitations.
+      - name: discovery_score
+        description: '{{ doc("discovery_score") }}'
+      - name: actionability_score
+        description: '{{ doc("actionability_score") }}'
+      - name: solo_private_score
+        description: '{{ doc("audience_fit_scores") }}'
+      - name: solo_social_score
+        description: '{{ doc("audience_fit_scores") }}'
+      - name: couple_score
+        description: '{{ doc("audience_fit_scores") }}'
+      - name: small_group_score
+        description: '{{ doc("audience_fit_scores") }}'
+      - name: group_suitability
+        description: '{{ doc("audience_fit_scores") }}'
+      - name: social_structure
+        description: '{{ doc("social_structure") }}'
+      - name: borough
+        description: Joined from the zip_centroids seed via the event's zip_code. Null if the ZIP isn't in the curated centroid table.
+      - name: price_amount
+        description: Passed through from staging. NULL stays NULL -- see stg_activity_events' cost column doc.
+      - name: event_name
+        description: Event display name, passed through from staging (renamed from title).
+      - name: source_name
+        description: Passed through from stg_activity_sources.
+      - name: channel_type
+        description: Passed through from stg_activity_sources -- feeds discovery_score.
+      - name: start_at
+        description: Event start timestamp, passed through from staging.
+      - name: end_at
+        description: Event end timestamp, passed through from staging. Nullable.
+      - name: location
+        description: Free-text venue/location description, passed through from staging.
+      - name: solo_friendly
+        description: Passed through from staging -- feeds the audience-fit scores.
+      - name: event_source_url
+        description: URL for this specific event, passed through from staging. Renamed to source_url in the mart.
+      - name: image_url
+        description: Optional event photo URL, passed through from staging. Nullable.
+      - name: zip_code
+        description: Passed through from staging, used only to derive borough here.
+      - name: vibe_tags
+        description: Passed through from staging, used only to derive the has_*_tag flags feeding the audience-fit scores.

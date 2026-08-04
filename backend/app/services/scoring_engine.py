@@ -30,6 +30,10 @@ MAX_PROXIMITY_RADIUS_MILES = 8.0
 
 CHANNEL_TRUST = {
     "website": 1.0,
+    # A machine-ingested public Open Data feed is the most reliably current
+    # channel here -- it is refreshed daily by the publisher rather than
+    # depending on a volunteer remembering to update a page.
+    "api": 1.0,
     "meetup": 0.85,
     "instagram": 0.6,
 }
@@ -96,6 +100,15 @@ def vibe_score(event_vibe_tags: str, desired_vibe: Optional[str]) -> Optional[fl
     return 1.0 if desired_vibe.lower() in tags else 0.0
 
 
+# Applied when the user *did* tell us where they are but the event itself
+# has no usable coordinates. Dropping the component instead (as we do when
+# the user gave no ZIP at all) would renormalise the remaining weights and
+# hand the event a strictly higher total than an event we could actually
+# locate nearby -- i.e. it would reward missing data. A neutral half-score
+# neither rewards nor punishes the gap.
+UNKNOWN_LOCATION_PROXIMITY = 0.5
+
+
 def proximity_score(distance_miles: Optional[float]) -> Optional[float]:
     """Returns None if distance couldn't be computed (component excluded)."""
     if distance_miles is None:
@@ -104,12 +117,23 @@ def proximity_score(distance_miles: Optional[float]) -> Optional[float]:
 
 
 def compute_distance_miles(row: pd.Series, zip_code: Optional[str]) -> Optional[float]:
+    """None whenever distance genuinely can't be computed -- either the
+    user gave no/unmapped ZIP, or the event itself has no coordinates.
+
+    The second case only started occurring once API-sourced events joined
+    the mart: a handful publish no usable location. Letting those through
+    would yield a NaN distance, which is not None and therefore silently
+    survives every `is None` guard downstream.
+    """
     if not zip_code:
         return None
     origin = zip_to_latlon(zip_code)
     if origin is None:
         return None
-    return haversine_miles(origin[0], origin[1], row["lat"], row["lon"])
+    lat, lon = row.get("lat"), row.get("lon")
+    if lat is None or lon is None or pd.isna(lat) or pd.isna(lon):
+        return None
+    return haversine_miles(origin[0], origin[1], lat, lon)
 
 
 def score_row(row: pd.Series, constraints: UserConstraints, today: Optional[date_type] = None) -> dict:
@@ -127,6 +151,10 @@ def score_row(row: pd.Series, constraints: UserConstraints, today: Optional[date
         row["channel_type"], row["update_cadence"], row["source_last_checked"], today
     )
     prox_score = proximity_score(distance_miles)
+    if prox_score is None and constraints.zip_code and zip_to_latlon(constraints.zip_code):
+        # The user asked a proximity question we cannot answer for this
+        # specific event. That is different from them never asking.
+        prox_score = UNKNOWN_LOCATION_PROXIMITY
     vibe_component = vibe_score(row["vibe_tags"], desired_vibe)
 
     components = {

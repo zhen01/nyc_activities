@@ -7,38 +7,190 @@ models:
       abandoned-freshness sources, and structurally invalid rows are
       excluded upstream -- every row in this mart could be shown to a user
       today. See dbt/tests/ for singular tests mapping 1:1 to each business
-      rule.
+      rule, and STATUS.md for the business-rule-to-test reference table.
     columns:
       - name: event_id
+        description: Primary key.
         tests:
           - unique
           - not_null
       - name: event_name
+        description: Event display name.
         tests:
           - not_null
       - name: activity_family
+        description: '{{ doc("activity_family") }}'
         tests:
           - accepted_values:
               arguments:
                 values: ['active', 'community', 'social_learning', 'creative', 'other']
-      - name: freshness_status
-        tests:
-          - accepted_values:
-              arguments:
-                values: ['fresh', 'stale']
-      - name: group_suitability
-        tests:
-          - accepted_values:
-              arguments:
-                values: ['solo_private', 'solo_social', 'couple', 'small_group']
+      - name: secondary_badge
+        description: '{{ doc("secondary_badge") }}'
       - name: social_structure
+        description: '{{ doc("social_structure") }}'
         tests:
           - accepted_values:
               arguments:
                 values: ['group_required', 'solo_friendly', 'solo_or_social', 'solo_or_group']
-      - name: source_url
+      - name: group_suitability
+        description: '{{ doc("audience_fit_scores") }}'
         tests:
-          - not_null
+          - accepted_values:
+              arguments:
+                values: ['solo_private', 'solo_social', 'couple', 'small_group']
+      - name: solo_private_score
+        description: '{{ doc("audience_fit_scores") }}'
+      - name: solo_social_score
+        description: '{{ doc("audience_fit_scores") }}'
+      - name: couple_score
+        description: '{{ doc("audience_fit_scores") }}'
+      - name: small_group_score
+        description: '{{ doc("audience_fit_scores") }}'
+      - name: beginner_friendly
+        description: True if the source's curator notes or the event title mention "beginner".
+      - name: price_amount
+        description: Event price in USD. Nullable -- never coalesced to 0; see assert_unknown_price_stays_null.sql.
       - name: start_at
+        description: Event start timestamp.
         tests:
           - not_null
+      - name: end_at
+        description: Event end timestamp. Nullable.
+      - name: borough
+        description: Joined from the zip_centroids seed via the event's ZIP code. Null for unmapped ZIPs.
+      - name: freshness_status
+        description: '{{ doc("freshness_status") }}'
+        tests:
+          - accepted_values:
+              arguments:
+                values: ['fresh', 'stale']
+      - name: actionability_score
+        description: '{{ doc("actionability_score") }}'
+      - name: discovery_score
+        description: '{{ doc("discovery_score") }}'
+      - name: image_url
+        description: Optional event photo URL. Nullable -- not populated in the sample dataset yet.
+      - name: source_url
+        description: URL for this specific event (registration/details page).
+        tests:
+          - not_null
+
+  - name: fct_event_observations
+    description: >
+      Append-only fact: one row per (event, date the event was confirmed
+      present in the feed). Exists because the API has no history endpoint
+      and raw ingestion upserts on guid, so evidence of what the feed said
+      on any past day is otherwise destroyed on the next run. A row asserts
+      presence only -- it never asserts absence, and a gap is as consistent
+      with the pipeline not running that day as with the event being pulled.
+      Incremental because it is genuinely append-only and grows by roughly
+      the feed size every day.
+    columns:
+      - name: event_id
+        description: Namespaced event key.
+        tests:
+          - not_null
+      - name: observed_on
+        description: Date the event was confirmed present in the feed.
+        tests:
+          - not_null
+      - name: scheduled_for
+        description: The date the event was scheduled to happen, as stated on that observation date.
+      - name: was_cancelled_on_that_date
+        description: >
+          Whether the feed was carrying a cancellation prefix for this event
+          on that date. Recorded per observation because knowing when the
+          feed started saying this is the whole point of the table.
+        tests:
+          - not_null
+      - name: days_ahead_of_event
+        description: >
+          Days between the observation and the event's scheduled date.
+          Negative when the feed was still carrying an event after it should
+          have taken place.
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns: ['event_id', 'observed_on']
+
+  - name: mart_source_reliability
+    description: >
+      Per-source reliability metrics -- cancellation rate, notice period,
+      reschedule rate -- computed from accumulated history. None of this is
+      obtainable from the source API, which publishes current state only;
+      these facts only come into existence once something records the feed
+      over time. Metrics deliberately expose their own denominator and
+      observation window so they cannot be read as more established than the
+      history behind them supports.
+    columns:
+      - name: source_id
+        tests:
+          - unique
+          - not_null
+      - name: observation_window_days
+        description: >
+          Days between first and last observation. Small values mean the
+          rates below rest on very little history and should not be read as
+          stable properties of the publisher.
+        tests:
+          - not_null
+      - name: events_tracked
+        description: Total events with at least one captured version.
+        tests:
+          - not_null
+      - name: events_with_observed_lifecycle
+        description: >
+          Events not already cancelled at first capture. The honest
+          denominator for cancellation metrics.
+        tests:
+          - not_null
+      - name: cancelled_before_tracking
+        description: >
+          Events already cancelled when first seen. Their cancellation timing
+          is unknowable, so they are excluded from rate and notice metrics
+          rather than biasing them.
+        tests:
+          - not_null
+      - name: cancellations_observed
+        description: Live-to-cancelled transitions actually witnessed inside the observation window.
+        tests:
+          - not_null
+      - name: observed_cancellation_rate_pct
+        description: >
+          Cancellations observed as a percentage of events with an observable
+          lifecycle. NULL rather than 0 when nothing is yet observable, so
+          "no history yet" cannot be misread as "never cancels".
+      - name: median_cancellation_lead_hours
+        description: Median hours of notice, over observed cancellations only. NULL until at least one is witnessed.
+
+  - name: mart_organizations
+    description: >
+      One row per active source, with a count of the events it currently
+      has in mart_activity_candidates. The count deliberately reflects
+      recommendable events only -- counting the raw event table instead
+      would include cancelled, expired and rule-violating rows, and so
+      would overstate how much a source is really contributing.
+    columns:
+      - name: source_id
+        description: Primary key.
+        tests:
+          - unique
+          - not_null
+      - name: source_name
+        description: Human-readable organization/channel name.
+        tests:
+          - not_null
+      - name: channel_type
+        description: How this source publishes. 'api' is the machine-ingested NYC Parks feed.
+        tests:
+          - accepted_values:
+              arguments:
+                values: ['website', 'meetup', 'instagram', 'api']
+      - name: is_active
+        description: Always true here -- inactive sources are filtered out of this mart.
+      - name: upcoming_event_count
+        description: Number of this source's events currently in mart_activity_candidates. Zero is a meaningful value, not a gap.
+        tests:
+          - not_null
+      - name: next_event_at
+        description: Start time of this source's soonest recommendable event; NULL when it has none.

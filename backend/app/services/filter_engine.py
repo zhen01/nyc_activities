@@ -1,15 +1,26 @@
 """Feasibility filtering -- product principle #1: "feasibility before
 attractiveness".
 
-MVP data source: reads directly from data/sample/*.csv (the same curated
-sample data used by the ingestion module), rather than from Postgres.
-This keeps the MVP runnable without Docker. Swapping this for a query
-against raw.activity_events/raw.activity_sources is a drop-in change once
-Docker/Postgres is available -- see STATUS.md.
+Data source: `analytics.mart_activity_candidates`, the dbt mart. This
+replaced a direct read of `data/sample/*.csv`, which had become actively
+misleading -- every curated sample event has since expired, so the CSV path
+served an empty (or stale) result set while a live NYC Parks feed sat
+ingested and unused in Postgres.
+
+Reading the mart also means the business rules now live in exactly one
+place. Expired events, inactive sources, abandoned-freshness sources,
+cancelled events and structurally invalid rows are already excluded
+upstream by `mart_activity_candidates`, each with a matching singular test
+in `dbt/tests/` -- this module no longer re-implements any of them, and
+only applies the constraints that depend on the specific user request.
+
+Consequence worth knowing: Postgres is now required to serve
+recommendations (`make db-up`). The previous "runs with no Docker" property
+is gone, deliberately.
 
 Two-stage pipeline:
-  1. filter_activities(): hard pass/fail feasibility -- excludes expired
-     and incompatible events. Never ranks by attractiveness.
+  1. filter_activities(): hard pass/fail feasibility -- excludes anything
+     violating a user constraint. Never ranks by attractiveness.
   2. build_recommendations(): hands the feasible set to scoring_engine for
      transparent ranking, then selects the final top 5 (or, in "surprise"
      mode, a weighted-random sample from the top-ranked pool).
@@ -18,51 +29,73 @@ Two-stage pipeline:
 from __future__ import annotations
 
 from datetime import datetime
-from pathlib import Path
 from typing import Optional
 
+import numpy as np
 import pandas as pd
 
+from app import db as app_db
 from app.models.schema import UserConstraints
 from app.services.scoring_engine import rank_candidates
-
-REPO_ROOT = Path(__file__).resolve().parents[3]
-SOURCES_CSV = REPO_ROOT / "data" / "sample" / "sources.csv"
-EVENTS_CSV = REPO_ROOT / "data" / "sample" / "events.csv"
 
 MAX_RESULTS = 5
 SURPRISE_POOL_SIZE = 10
 
+MART_RELATION = "analytics.mart_activity_candidates"
+
+# The mart's column names are warehouse-facing; the serving layer (scoring,
+# presentation, the API schema) speaks in the names below. Renaming here
+# keeps that one translation in a single place instead of scattering
+# mart-specific names through the request path.
+_MART_TO_SERVING = {
+    "event_name": "title",
+    "activity_category": "category",
+    "start_at": "start_time",
+    "end_at": "end_time",
+    "price_amount": "cost",
+}
+
 
 def load_activities() -> pd.DataFrame:
-    """Load and join events with their source organizations."""
-    sources = pd.read_csv(SOURCES_CSV)
-    events = pd.read_csv(EVENTS_CSV, dtype={"zip_code": str})
+    """Read recommendable candidates from the dbt mart.
 
-    events["start_time"] = pd.to_datetime(events["start_time"])
-    events["end_time"] = pd.to_datetime(events["end_time"])
-    events["solo_friendly"] = events["solo_friendly"].astype(str).str.lower() == "true"
+    Every row returned here has already passed the mart's business rules,
+    so this is a straight read plus a column rename -- no filtering.
+    """
+    engine = app_db.get_engine()
+    df = pd.read_sql(f"select * from {MART_RELATION}", engine)
+    df = df.rename(columns=_MART_TO_SERVING)
 
-    merged = events.merge(
-        sources[
-            ["source_id", "name", "last_checked", "channel_type", "update_cadence", "notes"]
-        ].rename(columns={"name": "source_name", "last_checked": "source_last_checked", "notes": "source_notes"}),
-        on="source_id",
-        how="left",
-    )
-    merged["source_last_checked"] = pd.to_datetime(merged["source_last_checked"]).dt.date
-    return merged
+    df["start_time"] = pd.to_datetime(df["start_time"])
+    df["end_time"] = pd.to_datetime(df["end_time"])
+    # Postgres DATE -> datetime.date, which is what confidence_score expects.
+    df["source_last_checked"] = pd.to_datetime(df["source_last_checked"]).dt.date
+    # Numeric in Postgres arrives as Decimal; downstream comparisons and the
+    # Pydantic float field both want a plain float. NULL stays NaN -> None.
+    df["cost"] = pd.to_numeric(df["cost"], errors="coerce")
+    return df
 
 
-def filter_activities(constraints: UserConstraints, now: Optional[datetime] = None) -> pd.DataFrame:
+def filter_activities(
+    constraints: UserConstraints,
+    now: Optional[datetime] = None,
+    activities: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
     """Return the set of activities that satisfy the given hard
     constraints -- expired and incompatible events are excluded. Never
     ranks by attractiveness; that's scoring_engine's job.
+
+    `activities` overrides the mart read. Tests pass a fixed fixture
+    through it: asserting filter behaviour against a live feed whose
+    contents change every day would make the suite both non-deterministic
+    and dependent on a running database.
     """
-    df = load_activities()
+    df = load_activities() if activities is None else activities.copy()
     now = now or datetime.now()
 
-    # Exclude expired events -- always, regardless of mode.
+    # Expiry is enforced by the mart (in NYC local time), not here. This
+    # second pass exists only because `now` is injectable for tests and can
+    # therefore differ from the mart's own "now".
     df = df[df["start_time"] >= now]
 
     # Category is only a hard constraint in "specific" mode. In "mood" and
@@ -71,10 +104,18 @@ def filter_activities(constraints: UserConstraints, now: Optional[datetime] = No
         df = df[df["category"].str.lower() == constraints.category.lower()]
 
     if constraints.max_cost is not None:
+        # An unknown cost never satisfies a budget: NaN <= x is False, so
+        # those rows drop out. That is intentional -- promising an event
+        # fits a budget we cannot verify would be the same "unknown price
+        # is free" error the analytics layer explicitly forbids.
         df = df[df["cost"] <= constraints.max_cost]
 
     if constraints.solo_friendly is True:
-        df = df[df["solo_friendly"]]
+        # Unknown (NULL) solo-friendliness is treated as "cannot promise",
+        # not as "yes". The API-sourced feed publishes no solo_friendly
+        # flag at all, so this filter legitimately returns very little --
+        # a visible coverage gap rather than a fabricated reassurance.
+        df = df[df["solo_friendly"].astype("boolean").fillna(False).astype(bool)]
 
     if constraints.date is not None:
         df = df[df["start_time"].dt.date == constraints.date]
@@ -110,9 +151,15 @@ def select_recommendations(
 
     if constraints.mode == "surprise":
         pool = scored_df.head(min(SURPRISE_POOL_SIZE, len(scored_df)))
-        weights = pool["total_score"].clip(lower=1.0)
+        weights = pool["total_score"].clip(lower=1.0).to_numpy(dtype=float)
         n = min(top_n, len(pool))
-        return pool.sample(n=n, weights=weights, random_state=random_state)
+        # pandas 3.0 dropped weighted sampling with replace=False, so draw the
+        # row positions with numpy instead. Same thing we asked pandas for --
+        # n distinct rows, picked with probability proportional to score --
+        # and still reproducible from random_state.
+        rng = np.random.default_rng(random_state)
+        picks = rng.choice(len(pool), size=n, replace=False, p=weights / weights.sum())
+        return pool.iloc[picks]
 
     return scored_df.head(top_n)
 
@@ -121,10 +168,11 @@ def build_recommendations(
     constraints: UserConstraints,
     now: Optional[datetime] = None,
     random_state: Optional[int] = None,
+    activities: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """Full pipeline: filter (feasibility) -> rank (transparent scoring)
     -> select (top 5, or weighted sample for "surprise" mode).
     """
-    feasible = filter_activities(constraints, now=now)
+    feasible = filter_activities(constraints, now=now, activities=activities)
     scored = rank_candidates(feasible, constraints, today=(now or datetime.now()).date())
     return select_recommendations(scored, constraints, random_state=random_state)

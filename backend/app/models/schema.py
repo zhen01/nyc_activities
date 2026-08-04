@@ -53,7 +53,11 @@ class Recommendation(BaseModel):
     # rule enforced in the analytics layer).
     cost: Optional[float]
     location: str
-    solo_friendly: bool
+    # Optional for the same reason as `cost` above: the NYC Parks feed
+    # publishes no solo-friendliness flag, and rendering that absence as
+    # `false` would tell the user an event is unsuitable for solo
+    # attendance when nobody ever said so. None means "not stated".
+    solo_friendly: Optional[bool]
     source_url: Optional[str]
     source_name: str
     source_verified_date: date

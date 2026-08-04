@@ -23,7 +23,8 @@ from datetime import date, datetime, timezone
 from typing import Any, Optional
 
 import requests
-from sqlalchemy import JSON, Column, Date, DateTime, MetaData, String, Table
+from sqlalchemy import JSON, Column, Date, DateTime, Float, MetaData, String, Table, text
+from sqlalchemy.engine import Engine
 
 from ingestion.db import RAW_SCHEMA, ensure_schema, make_engine, upsert_rows
 
@@ -69,10 +70,38 @@ def build_table(schema: Optional[str] = RAW_SCHEMA) -> tuple[MetaData, Table]:
         Column("categories", String),
         Column("link_url", String),
         Column("registration_url", String),
+        # lat/lon are parsed out of the API's "coordinates" string rather
+        # than being separate API fields -- see parse_coordinates(). They
+        # are the only reason proximity ranking can work for API-sourced
+        # events, which have no zip_code the way the curated CSV events do.
+        Column("lat", Float),
+        Column("lon", Float),
+        Column("description", String),
         Column("raw_payload", JSON, nullable=False),
         Column("ingested_at", DateTime, nullable=False),
     )
     return metadata, table
+
+
+def run_pending_migrations(engine: Engine, schema: str) -> None:
+    """Additively add columns that `metadata.create_all()` won't add to an
+    already-existing table (it only creates missing tables, never alters
+    existing ones). No-op on SQLite, where tests build fresh metadata.
+
+    Uses ADD COLUMN IF NOT EXISTS so this is safe on every run, mirroring
+    ingestion.db.run_pending_migrations for the curated-CSV tables.
+    """
+    if engine.dialect.name != "postgresql":
+        return
+    with engine.begin() as conn:
+        for column, coltype in (("lat", "DOUBLE PRECISION"), ("lon", "DOUBLE PRECISION"),
+                                ("description", "TEXT")):
+            conn.execute(
+                text(
+                    f'ALTER TABLE "{schema}".nyc_parks_events '
+                    f"ADD COLUMN IF NOT EXISTS {column} {coltype}"
+                )
+            )
 
 
 def fetch_events(limit: int = DEFAULT_RECORD_LIMIT, page_size: int = PAGE_SIZE) -> list[dict[str, Any]]:
@@ -133,6 +162,36 @@ def _extract_url(value: Any) -> Optional[str]:
     return None
 
 
+def parse_coordinates(value: Any) -> tuple[Optional[float], Optional[float]]:
+    """Parse the API's "coordinates" field into (lat, lon).
+
+    The API returns a single comma-separated string, e.g.
+    "40.62894289677700000, -73.89599752426100000". Returns (None, None)
+    for a missing, empty, or unparseable value rather than raising: a
+    missing location is a real and acceptable state (it only means
+    proximity ranking is unavailable for that event), unlike a missing
+    guid or a corrupt date, which make the record unusable.
+
+    Values outside plausible NYC-area bounds are rejected as (None, None)
+    rather than stored -- a garbage coordinate that silently ranks an
+    event as "nearby" is worse than having no coordinate at all.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None, None
+    parts = value.split(",")
+    if len(parts) != 2:
+        return None, None
+    try:
+        lat = float(parts[0].strip())
+        lon = float(parts[1].strip())
+    except ValueError:
+        return None, None
+    if not (40.0 <= lat <= 41.2) or not (-74.5 <= lon <= -73.4):
+        logger.warning("nyc_parks: coordinates outside NYC bounds, dropping: %r", value)
+        return None, None
+    return lat, lon
+
+
 def parse_event_date(value: Any, field_name: str) -> Optional[date]:
     """Validate/parse a Socrata calendar_date string for safe storage in a
     SQL Date column. Returns None for missing/empty values. Raises
@@ -160,6 +219,8 @@ def parse_record(record: dict[str, Any]) -> dict[str, Any]:
     if not source_record_id:
         raise NycParksRecordError("record is missing required field 'guid'")
 
+    lat, lon = parse_coordinates(record.get("coordinates"))
+
     return {
         "source_record_id": str(source_record_id),
         "title": record.get("title"),
@@ -172,6 +233,9 @@ def parse_record(record: dict[str, Any]) -> dict[str, Any]:
         "categories": record.get("categories"),
         "link_url": _extract_url(record.get("link")),
         "registration_url": _extract_url(record.get("registration_url")),
+        "lat": lat,
+        "lon": lon,
+        "description": record.get("description"),
         "raw_payload": record,
         "ingested_at": datetime.now(timezone.utc),
     }
@@ -203,6 +267,7 @@ def ingest(limit: int = DEFAULT_RECORD_LIMIT, schema: str = RAW_SCHEMA) -> None:
     ensure_schema(engine, schema)
     metadata, table = build_table(schema=schema)
     metadata.create_all(engine)
+    run_pending_migrations(engine, schema)
 
     raw_records = fetch_events(limit=limit)
     logger.info("nyc_parks: fetched %d raw record(s) from the API", len(raw_records))

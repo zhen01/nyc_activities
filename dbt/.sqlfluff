@@ -8,6 +8,14 @@ max_line_length = 100
 # satisfy it.
 exclude_rules = LT02
 
+[sqlfluff:rules:references.keywords]
+# "location" is a non-reserved Postgres keyword, but it is also the column
+# name this project already uses end to end -- raw.activity_events, every
+# staging/intermediate/mart model, the API response schema and the frontend
+# all call it `location`. Renaming it in one model to satisfy RF04 would
+# make the pipeline less consistent, not more.
+ignore_words = location
+
 [sqlfluff:templater:dbt]
 profiles_dir = .
 project_dir = .

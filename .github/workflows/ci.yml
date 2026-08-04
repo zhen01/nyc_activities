@@ -38,35 +38,35 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      # uv reads the Python version from .python-version and installs the exact
+      # locked dependency set, so CI runs what a contributor runs locally.
+      - uses: astral-sh/setup-uv@v5
         with:
-          python-version: "3.11"
+          enable-cache: true
 
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
 
       - name: Install dependencies
-        run: |
-          pip install -r ingestion/requirements.txt
-          pip install -r backend/requirements.txt
+        run: uv sync --locked
 
       - name: ruff check
-        run: ruff check .
+        run: uv run ruff check .
 
       - name: sqlfluff lint (dbt models)
         working-directory: dbt
-        run: sqlfluff lint models --dialect postgres
+        run: uv run sqlfluff lint models --dialect postgres
 
       - name: docker compose config
         run: docker compose config
 
       - name: pytest (ingestion)
-        run: python -m pytest ingestion/tests
+        run: uv run python -m pytest ingestion/tests
 
       - name: pytest (backend)
         working-directory: backend
-        run: python -m pytest tests
+        run: uv run python -m pytest tests
 
       - name: frontend build (compile check)
         working-directory: frontend
@@ -75,16 +75,16 @@ jobs:
           npm run build
 
       - name: Load fixture data (ingestion)
-        run: python -m ingestion
+        run: uv run python -m ingestion
 
       - name: dbt deps
         working-directory: dbt
-        run: dbt deps --profiles-dir .
+        run: uv run dbt deps --profiles-dir .
 
       - name: dbt seed
         working-directory: dbt
-        run: dbt seed --profiles-dir .
+        run: uv run dbt seed --profiles-dir .
 
       - name: dbt build
         working-directory: dbt
-        run: dbt build --profiles-dir .
+        run: uv run dbt build --profiles-dir .

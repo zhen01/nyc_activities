@@ -1,0 +1,97 @@
+name: Daily refresh
+
+# The NYC Parks API serves a rolling 14-day window and offers no history
+# endpoint, so every day this does not run is a day of feed state that can
+# never be recovered. The snapshot only accumulates change history if
+# something invokes it on a schedule -- without this workflow the SCD2 table
+# would hold exactly one version per event forever.
+#
+# 09:15 UTC ~= 04:15/05:15 New York, comfortably after the publisher's
+# overnight updates and outside the hours when a partial feed is likely.
+on:
+  schedule:
+    - cron: "15 9 * * *"
+  workflow_dispatch:
+
+concurrency:
+  # Two overlapping runs would both ingest and both snapshot, which risks
+  # recording a spurious version pair for the same underlying state.
+  group: daily-refresh
+  cancel-in-progress: false
+
+env:
+  POSTGRES_USER: nyc_activities
+  POSTGRES_PASSWORD: nyc_activities
+  POSTGRES_DB: nyc_activities
+  POSTGRES_HOST: localhost
+  POSTGRES_PORT: "5432"
+  DATABASE_URL: postgresql+psycopg://nyc_activities:nyc_activities@localhost:5432/nyc_activities
+  NYC_OPEN_DATA_APP_TOKEN: ${{ secrets.NYC_OPEN_DATA_APP_TOKEN }}
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: nyc_activities
+          POSTGRES_PASSWORD: nyc_activities
+          POSTGRES_DB: nyc_activities
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U nyc_activities"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Ingest curated sources
+        run: uv run python -m ingestion
+
+      - name: Ingest live NYC Parks feed
+        run: uv run python -m ingestion.nyc_parks
+
+      - name: Snapshot feed state
+        working-directory: dbt
+        run: |
+          uv run dbt deps --profiles-dir .
+          uv run dbt snapshot --profiles-dir .
+
+      - name: Build and test models
+        working-directory: dbt
+        run: |
+          uv run dbt seed --profiles-dir .
+          uv run dbt build --profiles-dir .
+
+      - name: Report what was captured
+        if: always()
+        run: |
+          uv run python - <<'PY'
+          import os
+          from sqlalchemy import create_engine, text
+
+          engine = create_engine(os.environ["DATABASE_URL"])
+          queries = {
+              "snapshot versions": "select count(*) from snapshots.snap_nyc_parks_events",
+              "distinct events":   "select count(distinct source_record_id) from snapshots.snap_nyc_parks_events",
+              "observation rows":  "select count(*) from analytics.fct_event_observations",
+              "observation days":  "select count(distinct observed_on) from analytics.fct_event_observations",
+              "recommendable now": "select count(*) from analytics.mart_activity_candidates",
+          }
+          with engine.connect() as conn:
+              for label, sql in queries.items():
+                  print(f"{label:20} {conn.execute(text(sql)).scalar()}")
+          PY

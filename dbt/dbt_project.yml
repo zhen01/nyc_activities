@@ -4,6 +4,12 @@ config-version: 2
 
 profile: 'nyc_activities'
 
+vars:
+  # Identifies the synthetic source row that represents the NYC Parks Open
+  # Data API (see stg_nyc_parks_source). Declared once here because both
+  # the source model and the event model must agree on it.
+  nyc_parks_source_id: 'nyc-parks-open-data'
+
 model-paths: ["models"]
 seed-paths: ["seeds"]
 test-paths: ["tests"]

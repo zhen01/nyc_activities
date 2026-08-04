@@ -1,455 +1,515 @@
-# NYC Activity Discovery Engine
+# NYC Activity Discovery — an analytics engineering project
 
 [![CI](https://github.com/zhen01/nyc_activities/actions/workflows/ci.yml/badge.svg)](https://github.com/zhen01/nyc_activities/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
 
-A personalized activity discovery tool for NYC: give it a free-time window, budget, and
-a few constraints, and get back 1-5 real, feasible, source-backed activities — including
-ones from small organizations (social sports leagues, free kayaking programs, volunteer
-marketplaces, language exchanges) that don't show up on mainstream event platforms.
+An end-to-end pipeline that turns two very different sources — a hand-curated
+organization directory and a live NYC Open Data API — into a single modeled,
+tested, documented analytics layer, and then actually consumes it from a product.
 
-Built as an end-to-end personal data project: a FastAPI recommendation service with
-transparent, inspectable scoring, backed by a Postgres ingestion pipeline and a dbt
-analytics layer, all exercised by an automated test suite and CI on every PR.
+**dbt** (staging → intermediate → marts, plus an SCD2 snapshot and an incremental
+fact table; 75 tests, one singular test per business rule) on **Postgres**, fed by
+idempotent **Python ingestion**, served through a **FastAPI** app, with **CI**
+running the whole thing against a real database on every PR and a scheduled job
+accumulating feed history daily.
 
-## Table of Contents
+The part worth reading is not the plumbing — it's what happened when a real feed
+replaced sample data. A public API that republishes cancelled events, stamps the
+wrong date on its own time fields, packs 28 categories into one delimited string,
+and publishes no price at all forces you to decide what a pipeline should do when
+the truth is *unknown*. Those decisions, and a genuine timezone bug they exposed,
+are documented in [What the live feed threw at us](#what-the-live-feed-threw-at-us).
 
-- [Problem](#problem)
-- [Product Principles](#product-principles)
-- [Features](#features)
-- [Tech Stack](#tech-stack)
-- [Architecture](#architecture)
-- [Quick Start](#quick-start-the-mvp)
-- [Repo Structure](#repo-structure)
-- [Local Data Ingestion (Postgres)](#local-data-ingestion-postgres)
-- [External Source: NYC Parks Public Events](#external-source-nyc-parks-public-events)
-- [Analytics Layer: dbt](#analytics-layer-dbt-mart_activity_candidates)
-- [Continuous Integration](#continuous-integration)
-- [Status & Roadmap](#status--roadmap)
+<details>
+<summary><strong>Product context</strong> — why the business rules are what they are</summary>
+
+NYC activity discovery is fragmented: big marketplaces surface commercial events,
+while smaller recurring communities publish only on their own sites, Instagram or
+newsletters. The product takes a free-time window, a budget and a few constraints,
+and returns a handful of real, feasible, source-backed activities.
+
+Two commitments drive every modeling decision in this repo:
+
+1. **Never recommend something that isn't real and current.** An outdated, cancelled
+   or unverifiable listing is worse than no result — it costs someone a trip across
+   the city. This is why exclusions are enforced in the mart with a test each,
+   rather than being left to the application.
+2. **Never state something the data doesn't support.** Unknown price, unknown
+   solo-friendliness and unknown location stay unknown rather than becoming
+   free/false/nearby.
+
+Result-set size is deliberately small, and every result explains itself.
+
+</details>
+
+---
+
+## Contents
+
+- [What this project demonstrates](#what-this-project-demonstrates)
+- [The pipeline](#the-pipeline)
+- [What the live feed threw at us](#what-the-live-feed-threw-at-us)
+- [Creating data the source doesn't have](#creating-data-the-source-doesnt-have)
+- [Modeling decisions worth defending](#modeling-decisions-worth-defending)
+- [Business rules → tests](#business-rules--tests)
+- [Quick start](#quick-start)
+- [Repo structure](#repo-structure)
+- [Ingestion layer](#ingestion-layer)
+- [Analytics layer (dbt)](#analytics-layer-dbt)
+- [Documentation & lineage](#documentation--lineage)
+- [Continuous integration](#continuous-integration)
+- [The application layer](#the-application-layer)
+- [Known limitations & what's next](#known-limitations--whats-next)
 - [License](#license)
 
-## Problem
+## What this project demonstrates
 
-NYC activity discovery is fragmented. Big marketplaces surface commercial/popular events;
-smaller recurring communities publish only on their own sites, Instagram, or newsletters.
-Someone with three free hours often spends more time searching than participating. This
-project reduces that information gap by turning scattered local knowledge into a
-trustworthy, constraint-aware recommendation — not by aggregating everything, but by
-being deliberately small and feasibility-first.
-
-## Product Principles
-
-1. **Feasibility before attractiveness** — reject anything that doesn't fit the user's
-   time, budget, or participation constraints.
-2. **Discovery without hallucination** — recommend from verified sources only, never
-   invented events.
-3. **Small result set** — a few strong choices, not a catalog.
-4. **Explain the recommendation** — show why it fits and what remains uncertain.
-5. **Progressive engineering** — prove usefulness with curated data before adding
-   infrastructure.
-6. **Human-maintainable sources** — a manual source directory is acceptable when
-   automation is unreliable or inappropriate.
-
-## Features
-
-- **Two-stage recommendation pipeline** — hard feasibility filtering, then transparent,
-  component-based scoring (no black-box model).
-- **Three request modes** — `specific` (hard category filter), `mood` (rank by vibe-tag
-  match), `surprise` (weighted-random sample from the top-scored pool, reproducible via a
-  fixed seed).
-- **Explainable results** — every recommendation ships a `score`, a `confidence_label`
-  derived from source-channel type and check recency, and a rule-based "why this fits"
-  string.
-- **Live external data source** — NYC Parks public events pulled from the NYC Open Data
-  Socrata API, upserted idempotently alongside curated CSV data.
-- **Idempotent ingestion** — CSV and API ingestion both upsert on a natural key; rerunning
-  produces `0 inserted, N updated`, never duplicate rows.
-- **dbt analytics mart** — a single `mart_activity_candidates` model that enforces every
-  business rule (expired events, inactive sources, unknown-price-is-not-free, stale
-  sources) in one place, with a singular SQL test per rule.
-- **React Discover page** — hero search (free time, date, after-time, "looking to"
-  intent), a category filter row, a photo-card grid, a "Discover hidden gems"
-  organizations row, and a sidebar (plan-at-a-glance, an explicitly-illustrative weather
-  card, a favorites summary).
-- **Server-persisted favorites** — heart-toggle any activity; persisted via
-  `GET/POST/DELETE /favorites`, scoped to an anonymous `device_id` (no login/auth).
-- **CI on every PR** — lint (`ruff`, `sqlfluff`), two pytest suites, a `frontend/`
-  build compile-check, ingestion, and `dbt build` all run against a real Postgres
-  service container.
-
-## Tech Stack
-
-| Layer | Tools |
+| Capability | Where to look |
 |---|---|
-| API | FastAPI, Pydantic, Uvicorn |
-| Frontend | React + Vite + TypeScript (`frontend/`) — no router/state library, one screen |
-| Ingestion | Python, SQLAlchemy, psycopg, requests, pandas |
-| Database | PostgreSQL 16 (Docker Compose locally) |
-| Analytics | dbt (staging → intermediate → mart), sqlfluff |
-| Testing | pytest (backend + ingestion suites, 18+ tests) |
-| CI/CD | GitHub Actions, Postgres service container |
-| External data | NYC Open Data Socrata API (NYC Parks public events) |
+| Layered dimensional modeling (staging → intermediate → marts), consistent grain | [`dbt/models/`](dbt/models) |
+| SCD Type 2 history over a source that publishes no history at all | [`snap_nyc_parks_events.sql`](dbt/snapshots/snap_nyc_parks_events.sql) |
+| Append-only incremental fact table, idempotent across same-day re-runs | [`fct_event_observations.sql`](dbt/models/marts/fct_event_observations.sql) |
+| Refusing to compute left-censored metrics rather than reporting an artefact | [`int_parks_event_lifecycle.sql`](dbt/models/intermediate/int_parks_event_lifecycle.sql) |
+| Scheduled pipeline so history actually accumulates | [`daily-refresh.yml`](.github/workflows/daily-refresh.yml) |
+| Business logic centralized in one place, not duplicated in application code | [`mart_activity_candidates.sql`](dbt/models/marts/mart_activity_candidates.sql) |
+| Handling genuinely messy source data without fabricating values | [`stg_nyc_parks_events.sql`](dbt/models/staging/stg_nyc_parks_events.sql) |
+| Data quality testing: 75 dbt tests, incl. 6 singular tests mapped 1:1 to business rules | [`dbt/tests/`](dbt/tests) + `_*.yml` |
+| Modeling a source system that has no row in your source directory | [`stg_nyc_parks_source.sql`](dbt/models/staging/stg_nyc_parks_source.sql) |
+| Correctness of "now" across timezones, enforced in models *and* their tests | [`dbt/macros/nyc_time.sql`](dbt/macros/nyc_time.sql) |
+| Idempotent upsert-based ingestion from both CSV and a paginated REST API | [`ingestion/`](ingestion) |
+| Self-documenting models: doc blocks, column descriptions, committed lineage site | [`dbt/docs_site/index.html`](dbt/docs_site/index.html) |
+| CI that rebuilds and retests the warehouse on every PR | [`.github/workflows/ci.yml`](.github/workflows/ci.yml) |
+| Deterministic tests over a non-deterministic live feed | [`backend/tests/conftest.py`](backend/tests/conftest.py) |
 
-## Architecture
+Scale: 1 seed, 10 models, 1 snapshot, 75 dbt tests, 81 Python tests. Roughly 200
+recommendable events at any moment from a rolling 14-day window, with change
+history accumulating daily.
+
+## The pipeline
 
 ```
-sources.yaml (curator finds & lists orgs/channels manually)
+data/sample/*.csv                    NYC Open Data Socrata API
+(curated, human-verified)            (live NYC Parks events, rolling 14-day window)
+      │                                        │
+      │  ingestion/ingest.py                   │  ingestion/nyc_parks.py
+      ▼                                        ▼
+raw.activity_sources/_events         raw.nyc_parks_events
+      │                                        │
+      ▼  stg_* (rename-only)                   ▼  stg_* (reshape + data-quality fixes)
+stg_activity_events/_sources         stg_nyc_parks_events/_source
+      │                                        │
+      └──────────────┬─────────────────────────┘  union
+                     ▼
+        int_activity_enriched   — freshness, discovery/actionability,
+                     │            audience fit (NULL when unknowable)
+                     ▼
+        mart_activity_candidates  — every business rule, enforced once
+        mart_organizations        — sources + recommendable-event counts
+                     ▼
+        FastAPI (filter → score → explain)  →  React Discover page
+
+
+  history track (daily schedule)
+  ──────────────────────────────
+raw.nyc_parks_events
       │
-      ▼  curator manually verifies an activity is real & current
-seed_activities.json / data/sample/*.csv (curated, human-verified)
+      ▼  snapshot, check strategy on content cols
+snap_nyc_parks_events        — SCD2: the only record of what the feed used to say
       │
-      ▼
-filter_engine.py   — hard constraints only (feasibility before attractiveness)
-      │  small candidate set
-      ▼
-scoring_engine.py  — transparent, inspectable ranking (proximity, vibe, source confidence)
-      │
-      ▼
-explain_engine.py  — "why this fits" + explicit uncertainty
-      │
-      ▼
-GET /recommendations  →  React Discover page (frontend/)
+      ├─────────────────────────────┐
+      ▼                             ▼
+int_parks_event_lifecycle    fct_event_observations  — append-only, incremental
+  per-event: cancelled?        one row per (event, date seen)
+  rescheduled? notice given?
+      │                             │
+      └──────────────┬──────────────┘
+                     ▼
+        mart_source_reliability   — cancellation rate, notice period,
+                                    reschedule rate per publisher
 ```
 
-Separately, `ingestion/` loads the same curated data (plus live NYC Parks events) into
-Postgres, and `dbt/` builds an analytics mart on top of that raw data — see
-[ARCHITECTURE.md](ARCHITECTURE.md) for the full data-flow diagram and rationale, and
-[STATUS.md](STATUS.md) for exactly which pieces are wired together today versus still
-independent tracks.
+Both feeds land in `raw`, dbt models them into two marts, and the API reads those
+marts. A business rule is written once, tested once, and enforced everywhere.
 
-## Quick Start (the MVP)
+## What the live feed threw at us
 
-The fastest way to see the product loop end to end (no Docker required — this reads
-`data/sample/*.csv` directly rather than Postgres):
+The project originally ran on curated sample CSVs. Every one of those events
+eventually expired, which meant the app was serving an empty result set while a
+live feed sat ingested and unused — so the serving layer was repointed at the
+warehouse and the real feed wired through. That surfaced five problems the clean
+sample data had never exercised.
+
+### 1. The time fields carry the wrong date
+
+`starttime` and `endtime` come back as full timestamps, but their date component
+is the feed's *publication* date — every row read `2026-07-20` regardless of when
+the event actually happens. The real date is in `startdate`. Only the time-of-day
+is trustworthy, so `start_at` is rebuilt from `startdate` plus that time, behind a
+regex guard so one malformed value can't fail the model.
+
+### 2. One string, 28 categories, no hierarchy
+
+`categories` is pipe-delimited free text (`Fitness | Volunteer | Gardening`), with
+28 distinct values and roughly 60% of rows carrying some fitness variant. Mapping
+it onto the project's 7-value taxonomy therefore needs a **priority order**, not a
+first match — otherwise a volunteer gardening event lands in `active` because
+"Fitness" appeared first. `active` is deliberately *last*: it's the broad catch-all,
+not a precise label.
+
+It also mixes genuine activity types with audience modifiers (`Best for Kids`,
+`Seniors`) and delivery format (`Virtual/Online Events`). Those describe *who* and
+*how*, not *what*, so they're surfaced as separate flags rather than overwriting the
+category. 5 of ~390 rows match nothing at all and stay `NULL`, which excludes them
+via an existing structural rule instead of guessing a bucket for them.
+
+### 3. Cancelled events keep being published
+
+The feed serves cancelled events indefinitely, recording the cancellation only as a
+`CANCELED:` prefix on the title. There is no status field. Those rows are otherwise
+completely healthy — upcoming, active source, fresh, valid URL — so without an
+explicit rule they'd be recommended. Hence a new business rule and
+[a test](dbt/tests/assert_no_cancelled_events_in_mart.sql) enforcing it.
+
+### 4. Coordinates were being thrown away at ingestion
+
+`coordinates` and `description` are present on every row of the payload but were
+never extracted into columns. Extracting them is what makes proximity ranking work
+for API events at all, since the feed publishes no ZIP code. Coordinates outside
+plausible NYC bounds are rejected rather than stored — a wrong coordinate that
+silently ranks an event as "nearby" is worse than no coordinate.
+
+### 5. The warehouse's "today" was not New York's today
+
+Postgres runs in UTC; the product is entirely NYC-local. Bare `current_timestamp`
+in the models therefore meant *UTC today*. Between 8pm and midnight EDT, UTC has
+already rolled over — so the mart was excluding that evening's remaining events as
+"expired" while they were still hours away. **15 events were affected at the moment
+it was caught.**
+
+Fixed with [`nyc_now()` / `nyc_today()`](dbt/macros/nyc_time.sql), used by the
+models *and* by the singular tests that guard them, so the two can't drift apart.
+
+## Creating data the source doesn't have
+
+The API publishes a rolling 14-day window of current state and no history
+endpoint. Ask it what it said yesterday and there is no answer — not behind a
+paywall, not in an archive. Raw ingestion upserts on the publisher's `guid`, so
+it too keeps only the latest version.
+
+That means a whole class of question is unanswerable from the source: *how often
+does this publisher cancel? how much notice do attendees get? how far ahead are
+events posted?* Those facts only come into existence if something records the
+feed over time.
+
+Three pieces do that:
+
+- **[`snap_nyc_parks_events`](dbt/snapshots/snap_nyc_parks_events.sql)** — SCD2
+  history via the `check` strategy over content columns. `ingested_at` is
+  deliberately *excluded* from `check_cols`: it is rewritten on every upsert
+  whether or not anything changed, so including it would manufacture a version
+  per run and turn a change log into a write log.
+- **[`fct_event_observations`](dbt/models/marts/fct_event_observations.sql)** —
+  append-only incremental fact, one row per (event, date confirmed present in
+  the feed). `delete+insert` on the composite key so a same-day re-run replaces
+  rather than duplicates. A row asserts presence only; a gap is never read as
+  absence, since it is equally consistent with the pipeline not having run.
+- **[`mart_source_reliability`](dbt/models/marts/mart_source_reliability.sql)** —
+  the payoff: cancellation rate, notice period, reschedule rate per source.
+
+### The correctness detail that matters most here
+
+13 events were already carrying a `CANCELED:` prefix the first time the pipeline
+ever saw them. Their cancellation happened before the observation window opened,
+so **the notice period is unknowable** — subtracting first-capture from the event
+date would produce a number describing when *I* started collecting, not anything
+about the publisher.
+
+So `cancellation_lead_hours` is populated only where the live→cancelled
+transition was actually witnessed between two snapshot versions. Everything else
+is `NULL` and flagged via `cancellation_observed`, and the reliability mart uses
+`events_with_observed_lifecycle` as its denominator rather than the total. It
+also reports `observation_window_days` alongside every rate, so a cancellation
+percentage computed over a few days cannot be misread as a stable property of
+the publisher.
+
+A daily [scheduled workflow](.github/workflows/daily-refresh.yml) runs
+ingest → snapshot → build in that order, because ingest overwrites raw with the
+feed's current state and the snapshot must read it before the next ingest
+destroys the previous version.
+
+## Modeling decisions worth defending
+
+### Unknown is not a default
+
+The API publishes no price, no solo-friendliness flag, and no vibe tags. Those stay
+`NULL` end to end:
+
+- an unknown price never satisfies a budget filter (the inverse of the
+  already-enforced "unknown price is not free" rule);
+- unknown solo-friendliness never satisfies a solo-friendly request;
+- the four audience-fit scores are `NULL` rather than computed — scoring them from
+  absent inputs would have given every such event exactly 60 for "couple", purely
+  from a constant baseline. A confident-looking number derived from nothing is worse
+  than an honest gap.
+
+The cost is real: some filters legitimately return very little. That gap is visible
+in `mart_organizations` rather than papered over.
+
+Fixing this also exposed a ranking flaw worth naming. Dropping the proximity
+component for an event with no coordinates renormalized the remaining weights and
+pushed it *above* an event confirmed to be 0.3 miles away — **missing data
+outranking good data**. Unlocatable events now take a neutral half-score instead.
+
+### The API is modeled as a source
+
+NYC Parks has no row in the hand-curated source directory, but conceptually it *is*
+a source, and all the downstream freshness/confidence/discovery logic is written in
+terms of a source's `channel_type` / `update_cadence` / `last_checked`. Rather than
+branching that logic on "CSV or API?", [`stg_nyc_parks_source.sql`](dbt/models/staging/stg_nyc_parks_source.sql)
+synthesizes the one source row the API deserves.
+
+Its `source_last_checked` is derived from `max(ingested_at)` rather than hardcoded,
+so **a pipeline that silently stops running decays in freshness instead of staying
+permanently "fresh"** — the failure mode shows up in the data itself.
+
+### Business rules live in the mart, not the application
+
+Expiry, inactive sources, abandoned freshness, missing URLs, unknown prices and
+cancellations are enforced once in `mart_activity_candidates`, each with a matching
+singular test. The API's `filter_engine.py` applies only the constraints belonging
+to a specific user request. Previously the same rules existed in both SQL and Python
+and could drift apart silently.
+
+`GET /organizations` reads `mart_organizations` for the same reason: counting the
+raw event table applies none of those rules, so it would advertise an organization
+on the strength of cancelled or expired events.
+
+## Business rules → tests
+
+Each rule is a singular test — custom SQL that fails if any row comes back — because
+each is really "the mart's `WHERE` clause is correct", which a generic schema test
+can't express.
+
+| Business rule | Test |
+|---|---|
+| Expired events excluded (in **NYC** local time) | [`assert_no_expired_events_in_mart.sql`](dbt/tests/assert_no_expired_events_in_mart.sql) |
+| Inactive sources excluded | [`assert_no_inactive_source_events_in_mart.sql`](dbt/tests/assert_no_inactive_source_events_in_mart.sql) |
+| Unknown price stays `NULL`, never coalesced to 0/free | [`assert_unknown_price_stays_null.sql`](dbt/tests/assert_unknown_price_stays_null.sql) |
+| Abandoned-freshness sources excluded (`stale` is kept, `abandoned` is not) | [`assert_no_abandoned_freshness_in_mart.sql`](dbt/tests/assert_no_abandoned_freshness_in_mart.sql) |
+| Missing source URL excluded — nothing to verify or register with | [`assert_no_missing_url_in_mart.sql`](dbt/tests/assert_no_missing_url_in_mart.sql) |
+| Cancelled events excluded | [`assert_no_cancelled_events_in_mart.sql`](dbt/tests/assert_no_cancelled_events_in_mart.sql) |
+
+The remaining 69 are generic schema tests (`unique`, `not_null`, `accepted_values`,
+`relationships`) declared beside each model. Full mapping, including the structural
+guarantees, in [STATUS.md](STATUS.md#business-rules--tests).
+
+## Quick start
+
+Needs Docker and [uv](https://docs.astral.sh/uv/). From a clean checkout:
 
 ```bash
-python3 -m venv .venv && source .venv/bin/activate   # skip if already created
-pip install -r backend/requirements.txt
-make mvp
-# equivalent: cd backend && uvicorn app.main:app --reload --port 8000
+uv sync                          # creates .venv on the pinned Python, from uv.lock
+cp .env.example .env && export $(grep -v '^#' .env | xargs)
+make db-up                       # Postgres via docker compose
+make ingest && make ingest-parks # curated CSVs + the live NYC Parks feed
+make dbt-deps && make dbt-seed && make dbt-build
 ```
 
-Open http://localhost:8000 in a browser to use the built React Discover page directly
-from FastAPI's static mount. Or query the API directly:
+Inspect the warehouse directly:
 
 ```bash
-curl "http://localhost:8000/recommendations?category=active&max_cost=15&solo_friendly=true"
+docker compose exec db psql -U nyc_activities -d nyc_activities \
+  -c "select activity_category, count(*) from analytics.mart_activity_candidates group by 1 order by 2 desc;" \
+  -c "select source_name, channel_type, upcoming_event_count from analytics.mart_organizations order by 3 desc;"
 ```
 
-### Frontend dev server (optional, for editing the UI)
-
-For live-reloading frontend development, run Vite and FastAPI side by side instead of
-using the built static bundle:
+Or run the app on top of it:
 
 ```bash
-# terminal 1
-cd backend && uvicorn app.main:app --reload --port 8000
-
-# terminal 2
-cd frontend && npm install && npm run dev
+make mvp   # http://localhost:8000
+curl "http://localhost:8000/recommendations?category=active&zip_code=10001"
 ```
 
-Open http://localhost:5173 — `vite.config.ts` proxies `/recommendations`,
-`/organizations`, and `/favorites` to the FastAPI backend on port 8000, so the frontend
-code never hardcodes a base URL.
+`make ingest-parks` pulls a rolling 14-day window — re-run it, then `make dbt-build`,
+to refresh the catalogue.
 
-To rebuild the static bundle FastAPI serves at `/` (what `make mvp` uses):
-
-```bash
-cd frontend && npm run build
-cp -r dist/* ../backend/app/static/
-```
-
-### Favorites (`GET/POST/DELETE /favorites`)
-
-Heart-toggling an activity persists it server-side in Postgres (`raw.app_favorites`),
-keyed by an anonymous `device_id` UUID the frontend generates and stores in
-`localStorage` — there's no login/auth system. This is the first API surface that
-requires Postgres to be running (`make db-up`); plain `/recommendations` calls (no
-`device_id`) still never touch it, preserving the CSV-only, Docker-free MVP demo path.
-
-### Organizations (`GET /organizations`)
-
-Powers the Discover page's "Discover hidden gems" row: active sources plus a count of
-their upcoming events, queried directly against `raw.activity_sources` /
-`raw.activity_events`. Like `/favorites`, this reads from Postgres directly rather than
-the CSV path `/recommendations` still uses — see [STATUS.md](STATUS.md) for why these
-two data paths currently coexist unresolved.
-
-### Inputs and ranking behavior
-
-Beyond category/budget/solo/date, the form supports:
-
-- **Starting ZIP code** — used to compute straight-line distance to each event (via a
-  small curated `data/sample/zip_centroids.csv` lookup, not a geocoding API). Distance
-  is a *scoring* factor, not a hard filter — an unmapped or omitted ZIP just drops
-  proximity from the ranking rather than erroring or zeroing out results.
-- **Mode**: `specific` (category is a hard filter, today's original behavior),
-  `mood` (category is not required; results are ranked by how well an event's
-  `vibe_tags` match the requested vibe), `surprise` (hard constraints still apply, but
-  the top-scored pool is weighted-sampled rather than a strict top-N, for variety).
-
-Every request runs through two stages:
-
-1. **Feasibility filter** (`filter_engine.py`) — hard pass/fail. Excludes expired events
-   (`start_time` in the past) and anything violating a hard constraint (category in
-   `specific` mode, budget, solo-friendly, date).
-2. **Transparent scoring** (`scoring_engine.py`) — ranks what's left using simple,
-   inspectable components (proximity, vibe match, source confidence), each normalized
-   0–1 and blended into a 0–100 score. Any component whose input wasn't provided (no
-   ZIP, no mood) is dropped from the blend, not fabricated.
-
-The API returns up to the **top 5** results, each including `score`, `confidence_label`
-(`High`/`Medium`/`Low`, based on the source's channel type and how recently it was
-checked relative to its own update cadence), `source_name`, `source_verified_date`,
-`distance_miles` (nullable), and a rule-based `explanation` string.
-
-## Repo Structure
+## Repo structure
 
 | Path | Purpose |
 |---|---|
-| `backend/app/main.py` | FastAPI entrypoint (routers + CORS + static mount) |
-| `backend/app/api/` | HTTP routes: `recommendations.py`, `favorites.py`, `organizations.py` |
-| `backend/app/models/schema.py` | Request/response models (`UserConstraints`, `Recommendation`) |
-| `backend/app/services/filter_engine.py` | Feasibility filtering (excludes expired/incompatible events) — principle #1 |
-| `backend/app/services/scoring_engine.py` | Transparent ranking (proximity, vibe match, source confidence) |
-| `backend/app/services/geo.py` | ZIP centroid lookup + straight-line distance |
-| `backend/app/services/presentation.py` | Display-only derived fields for the Discover page: badges, tags, category labels, transit-time estimate |
-| `backend/app/services/explain_engine.py` | "Why this fits" explanation generation — principle #4 |
-| `data/sample/zip_centroids.csv` | Small curated NYC ZIP → lat/lon lookup table (no geocoding API) |
-| `backend/app/db.py` | Postgres access for `favorites`/`organizations` (reuses `ingestion/db.py`'s table definitions) — see STATUS.md's noted CSV-vs-Postgres split |
-| `backend/data/sources.yaml` | Manually maintained directory of orgs/channels — principle #6 |
-| `backend/data/seed_activities.json` | Curated, human-verified activities actually served to users |
-| `backend/scripts/load_seed_data.py` | Loads seed data into the database |
-| `backend/tests/` | Unit + API tests: filter/scoring engines, presentation, favorites, organizations |
-| `backend/app/static/` | Built React app (from `frontend/dist/`); prior plain HTML/JS page archived at `static/legacy/` |
-| `frontend/src/` | React + Vite + TS Discover page: `App.tsx`, `api/client.ts`, `components/` (`HeroSearch`, `CategoryFilterRow`, `ActivityCard`, `FavoriteButton`, `OrganizationRow`, `Sidebar`, ...) |
-| `docs/source_directory_guide.md` | How to add/maintain a source and promote it to a seed activity |
-| `ARCHITECTURE.md` | How data flows end to end |
-| `STATUS.md` | What currently works, the highest-risk issue, and the next deliverable |
-| `docker-compose.yml` | Local Postgres for the ingestion vertical slice |
-| `data/sample/*.csv` | Curated sample data loaded by the ingestion module |
-| `ingestion/db.py` | Engine, `raw` schema table definitions, upsert helper |
+| **Analytics layer** | |
+| `dbt/models/staging/stg_activity_*.sql` | Rename-only views over the curated `raw.*` tables |
+| `dbt/models/staging/stg_nyc_parks_events.sql` | Reshapes the live feed: rebuilds timestamps, maps 28 categories by priority, flags cancelled/virtual |
+| `dbt/models/staging/stg_nyc_parks_source.sql` | Synthesizes the API as a source row so downstream logic applies unchanged |
+| `dbt/models/intermediate/int_activity_enriched.sql` | Unions both feeds; computes freshness, audience-fit, discovery/actionability |
+| `dbt/models/marts/mart_activity_candidates.sql` | The recommendable-events mart — every business-rule exclusion, in one place |
+| `dbt/models/marts/mart_organizations.sql` | One row per active source + how many recommendable events it currently has |
+| `dbt/macros/nyc_time.sql` | `nyc_now()` / `nyc_today()` — "now" in NYC local time, not the warehouse's UTC |
+| `dbt/models/docs.md` | Shared doc blocks for derived fields, referenced via `{{ doc(...) }}` |
+| `dbt/snapshots/snap_nyc_parks_events.sql` | SCD2 change history — the only place the feed's past state exists |
+| `dbt/models/marts/fct_event_observations.sql` | Append-only incremental fact: event present in feed on date |
+| `dbt/models/intermediate/int_parks_event_lifecycle.sql` | Per-event lifecycle; refuses to compute left-censored notice periods |
+| `dbt/models/marts/mart_source_reliability.sql` | Cancellation rate, notice period, reschedule rate per source |
+| `dbt/tests/` | One singular SQL test per business rule |
+| `dbt/seeds/zip_centroids.csv` | Small curated ZIP → lat/lon/borough table (deliberately not a geocoding API) |
+| **Ingestion** | |
+| `ingestion/db.py` | Engine, `raw` table definitions, dialect-aware upsert helper, additive migrations |
+| `ingestion/ingest.py` | Reads curated CSVs, validates, upserts, logs counts |
+| `ingestion/nyc_parks.py` | Fetches/parses/loads the paginated Socrata API into `raw.nyc_parks_events` |
 | `ingestion/validate.py` | Required-column/value and date validation |
-| `ingestion/ingest.py` | Reads CSVs, validates, upserts into Postgres, logs counts |
-| `ingestion/nyc_parks.py` | Fetches/parses/loads the NYC Parks API into `raw.nyc_parks_events`, isolated from the CSV path |
-| `ingestion/tests/` | Validation, dedup, and NYC Parks ingestion tests |
-| `dbt/models/staging/` | Renaming-only views over `raw.*` (`stg_activity_sources`, `stg_activity_events`) |
-| `dbt/models/intermediate/int_activity_enriched.sql` | Joins staging + `zip_centroids` seed; computes freshness, audience-fit scores, discovery/actionability scores |
-| `dbt/models/marts/mart_activity_candidates.sql` | The recommendable-events mart — applies every business-rule exclusion in one place |
-| `dbt/tests/` | Singular SQL tests mapping 1:1 to each business rule (expired, inactive source, unknown price, stale freshness, missing URL) |
-| `.github/workflows/ci.yml` | Runs on every PR: `ruff`, `sqlfluff`, both pytest suites, ingestion, `dbt build` |
-| `Makefile` | `db-up`, `db-down`, `ingest`, `test`, `test-backend`, `dbt-deps`, `dbt-seed`, `dbt-build` |
+| `ingestion/tests/` | Validation, dedup/idempotency, API parsing, coordinate-bounds tests |
+| **Application** | |
+| `backend/app/services/filter_engine.py` | Reads the mart; applies the user's own constraints only |
+| `backend/app/services/scoring_engine.py` | Transparent ranking (proximity, vibe, source confidence) — no learned weights |
+| `backend/app/services/explain_engine.py` | Rule-based "why this fits" + explicit uncertainty |
+| `backend/app/services/presentation.py` | Display-only derived fields (badges, tags, transit estimate) |
+| `backend/app/api/` | `recommendations.py`, `favorites.py`, `organizations.py` |
+| `backend/tests/conftest.py` | Deterministic fixture so tests don't assert against a live feed |
+| `frontend/src/` | React + Vite + TS Discover page |
+| **Docs & ops** | |
+| [`ARCHITECTURE.md`](ARCHITECTURE.md) | How data flows end to end, and why each layer exists |
+| [`STATUS.md`](STATUS.md) | What works today, the highest-risk issue, the next deliverable |
+| `.github/workflows/ci.yml` | Lint, both pytest suites, frontend build, ingestion, `dbt build` |
+| `.github/workflows/daily-refresh.yml` | Scheduled ingest → snapshot → build, so history accumulates |
+| `Makefile` | `db-up`, `ingest`, `ingest-parks`, `dbt-*`, `refresh`, `test`, `test-backend`, `mvp` |
 
-## Local Data Ingestion (Postgres)
+## Ingestion layer
 
-This is the first runnable piece of the project: loading curated sample CSV data into a
-local Postgres database. It does not include the API, UI, or recommendation logic yet.
+Two independent paths that share only generic plumbing (engine, upsert helper,
+schema creation) from `ingestion/db.py`.
 
-Note: `data/sample/*.csv` (raw ingestion sample data) is separate from
-`backend/data/sources.yaml` (the curated org directory for the future recommendation
-engine) — same word "sources," different purpose and consumer. Don't conflate them.
+**Curated CSVs** (`make ingest`) load `data/sample/*.csv` into
+`raw.activity_sources` / `raw.activity_events`. **The NYC Parks API**
+(`make ingest-parks`) pages through the Socrata dataset `w3wp-dpdi` in batches of
+50 and loads `raw.nyc_parks_events`, keeping the full original record in a
+`raw_payload` JSON column so no field is lost to the column projection.
 
-### Prerequisites
-
-- Docker Desktop (for `docker compose`)
-- Python 3.11+ recommended (a virtualenv is strongly recommended)
-
-### Setup
-
-```bash
-# 1. Create and activate a virtual environment
-python3 -m venv .venv
-source .venv/bin/activate
-
-# 2. Install ingestion dependencies
-pip install -r ingestion/requirements.txt
-
-# 3. Configure environment variables
-cp .env.example .env
-# edit .env if you want non-default credentials
-
-# 4. Start Postgres
-make db-up
-# equivalent: docker compose up -d db
-
-# 5. Load the environment variables and run ingestion
-export $(grep -v '^#' .env | xargs)
-make ingest
-# equivalent: python -m ingestion
-```
-
-You should see log output like:
-
-```
-sources.csv: 5 inserted, 0 updated
-events.csv: 8 inserted, 0 updated
-```
-
-Running `make ingest` again will report `0 inserted, N updated` — no duplicate rows are
-created, since each row is upserted on its natural key (`source_id` / `event_id`).
-
-### Verifying row counts
-
-```bash
-docker compose exec db psql -U nyc_activities -d nyc_activities \
-  -c "select count(*) from raw.activity_sources;" \
-  -c "select count(*) from raw.activity_events;"
-```
-
-### Running tests
-
-```bash
-pytest ingestion/tests
-# or: make test
-```
-
-Tests validate column/value/date checks and the upsert (dedup) logic directly; the
-dedup tests run against an in-memory SQLite database (no Docker required) since the
-upsert helper is dialect-aware and exercises the same code path against Postgres in
-production.
-
-The MVP's filter/scoring engine has its own test suite:
-
-```bash
-cd backend && python -m pytest tests
-# or: make test-backend
-```
-
-Covers: expired-event exclusion, hard-constraint filtering per mode, proximity/vibe/
-confidence scoring components, top-5 ranking order, and surprise-mode sampling
-(including reproducibility with a fixed random seed).
-
-### Stopping Postgres
-
-```bash
-make db-down
-# equivalent: docker compose down
-```
-
-## External Source: NYC Parks Public Events
-
-The second source in the raw layer: upcoming NYC Parks public events, fetched live
-from the NYC Open Data Socrata API ("NYC Parks Public Events - Upcoming 14 Days",
-dataset `w3wp-dpdi`). This is isolated from the curated-CSV path above --
-`ingestion/nyc_parks.py` owns its own fetch/parse/table logic and writes to its own
-table, only reusing the generic engine/upsert helpers from `ingestion/db.py`.
-
-### Environment variables
+Both upsert on a natural key (`source_id` / `event_id` / the API's `guid`), so
+re-running reports `0 inserted, N updated` and never duplicates rows. Neither does
+any business normalization — categories aren't mapped and costs aren't inferred at
+this layer. That's staging's job.
 
 | Variable | Required | Purpose |
 |---|---|---|
-| `DATABASE_URL` | yes | Same connection string used by the CSV ingestion (see above) |
-| `NYC_OPEN_DATA_APP_TOKEN` | no | Optional Socrata app token; raises the default public rate limit. Not required for normal use |
-| `NYC_PARKS_RECORD_LIMIT` | no | Max records to fetch per run (default 200), paginated in batches of 50 |
+| `DATABASE_URL` | yes | Postgres connection string, shared by ingestion, dbt and the API |
+| `NYC_OPEN_DATA_APP_TOKEN` | no | Socrata app token; raises the default public rate limit |
+| `NYC_PARKS_RECORD_LIMIT` | no | Max records per run (default 200) |
 
-### Running the API ingestion
+A latent bug found while building the mart is worth recording: a blank numeric cell
+was round-tripping through pandas as `NaN` instead of a true SQL `NULL`, because
+assigning `None` into a `float64` column is silently coerced back. In a Postgres
+`numeric` column `NaN` sorts and compares like a *huge* number rather than an
+absence — which would have quietly broken the "unknown price is not free" rule
+downstream. Fixed with `.astype(object)` before the conversion.
 
-```bash
-make db-up      # if not already running
-export $(grep -v '^#' .env | xargs)
-make ingest-parks
-# equivalent: python -m ingestion.nyc_parks
-```
+## Analytics layer (dbt)
 
-Output looks like:
+**Layering.** Staging is one model per source table, rename-only for the curated
+feed and reshaping for the API feed. `int_activity_enriched` unions them and does
+all the derivation. The marts apply exclusions and select the final field list.
+Grain is one row per event throughout — the intermediate model adds columns, never
+rows.
 
-```
-nyc_parks: fetched 20 raw record(s) from the API
-nyc_parks_events: 20 inserted, 0 updated, 0 failed
-```
-
-Re-running upserts by the API's `guid` (stored as `source_record_id`) -- no
-duplicates, existing rows are never deleted, and rows are updated in place with a
-fresh `ingested_at`.
-
-### Expected raw table
-
-`raw.nyc_parks_events`: `source_record_id` (PK, the API's `guid`), a handful of
-directly-copied fields (`title`, `startdate`, `enddate`, `starttime`, `endtime`,
-`location`, `parknames`, `categories`, `link_url`, `registration_url`), a
-`raw_payload` JSON column holding the full original API record, and `ingested_at`.
-No business normalization happens here (categories aren't mapped, costs aren't
-inferred, etc.) -- that's deferred to a later curated/staging step.
-
-### Verifying row counts
-
-```bash
-docker compose exec db psql -U nyc_activities -d nyc_activities \
-  -c "select count(*) from raw.nyc_parks_events;" \
-  -c "select source_record_id, title, startdate, location from raw.nyc_parks_events limit 5;"
-```
-
-## Analytics Layer: dbt (`mart_activity_candidates`)
-
-A dbt project under `dbt/` turns `raw.activity_sources` / `raw.activity_events` into a
-single mart of records that could plausibly be recommended, with every business rule
-enforced in one place instead of scattered across application code.
-
-**Business rules** (each one has a matching singular test in `dbt/tests/`):
-
-- Expired events cannot appear (`coalesce(end_at, start_at) >= now()`).
-- Inactive sources cannot appear (`is_active = true`).
-- An unknown price must never be treated as free — `NULL` stays `NULL` all the way
-  through staging into the mart, it's never coalesced to `0`.
-- Events whose source hasn't been checked recently enough (`freshness_status =
-  'abandoned'`, see below) are excluded, not just penalized.
-
-**Layering**: `stg_activity_sources` / `stg_activity_events` (rename-only views over
-`raw.*`) → `int_activity_enriched` (joins in the `zip_centroids` seed for `borough`,
-computes `freshness_status` and the audience-fit/discovery/actionability scores) →
-`mart_activity_candidates` (applies every exclusion rule, selects the final field list).
-
-**Freshness**: `freshness_status` is `fresh` / `stale` / `abandoned`, based on days
-since the *source's* `last_checked` relative to its `update_cadence` (`daily`/`weekly`/
-`seasonal` → 1/7/90 days), using the same `CADENCE_DAYS` mapping as
-`backend/app/services/scoring_engine.py` so "freshness" means the same thing in the API
-and in this mart. Only `abandoned` is excluded from the mart; `stale` rows are kept but
-flagged.
+**Freshness.** `freshness_status` is `fresh` / `stale` / `abandoned`, from days
+since the *source's* `last_checked` relative to its own `update_cadence`
+(`daily`/`weekly`/`seasonal` → 1/7/90 days). Only `abandoned` is excluded; `stale`
+rows are kept and flagged. The same cadence mapping exists in
+`scoring_engine.py` so "freshness" means one thing in both the warehouse and the API.
 
 **Audience-fit scores** (`solo_private_score`, `solo_social_score`, `couple_score`,
-`small_group_score`, each 0-100): simple, documented point sums from `solo_friendly` +
-`vibe_tags` — rule-based, not a model, so every point is traceable to a specific input
-(consistent with the "no black-box scoring" principle already established for the API).
-`group_suitability` is just the label of whichever of the four scores is highest.
+`small_group_score`) are documented point sums over `solo_friendly` and vibe tags —
+rule-based, so every point traces to a specific input, and `NULL` when the inputs
+are unknown. `group_suitability` is the label of whichever score is highest.
 
-### Running it
+`profiles.yml` lives in `dbt/` rather than `~/.dbt/` and reuses the same `POSTGRES_*`
+env vars as `ingestion/` and `docker-compose.yml` — one connection config for the
+whole project.
 
-```bash
-pip install -r ingestion/requirements.txt   # now includes dbt-core, dbt-postgres, ruff, sqlfluff
-make db-up
-export $(grep -v '^#' .env | xargs)
-make ingest          # populates raw.* that dbt reads from
-make dbt-deps        # installs dbt_utils
-make dbt-seed        # loads dbt/seeds/zip_centroids.csv
-make dbt-build       # runs all models + all tests
-```
+## Documentation & lineage
 
-`profiles.yml` lives in `dbt/` (not `~/.dbt/`) and reuses the same `POSTGRES_*` env vars
-as `ingestion/` and `docker-compose.yml` — one connection config for the whole project.
+Every model and mart column has a `description`. Shared explanations for derived
+fields (`freshness_status`, `discovery_score`, the audience scores) live once in
+`dbt/models/docs.md` as doc blocks and are referenced via `{{ doc(...) }}` rather
+than copy-pasted.
 
-Verify the mart directly:
+A self-contained static docs site — lineage graph, every description, every test —
+is committed at [`dbt/docs_site/index.html`](dbt/docs_site/index.html). Open it
+directly in a browser; no server needed.
 
 ```bash
-docker compose exec db psql -U nyc_activities -d nyc_activities \
-  -c "select event_id, event_name, freshness_status, group_suitability from analytics.mart_activity_candidates;"
+cd dbt && dbt docs generate --profiles-dir . --static
+cp target/static_index.html docs_site/index.html
 ```
 
-## Continuous Integration
+## Continuous integration
 
-`.github/workflows/ci.yml` runs on every pull request against a real Postgres service
-container: `ruff check`, `sqlfluff lint` (dbt models), `docker compose config`, both
-pytest suites, `python -m ingestion` (to populate `raw.*`), then `dbt deps` / `dbt seed`
-/ `dbt build`. The point isn't a complex pipeline — it's that a broken data model or a
-failing test is caught automatically before merge, not discovered later in Postgres.
+`.github/workflows/ci.yml` runs on every PR against a real Postgres service
+container: `ruff`, `sqlfluff` (with the dbt templater), both pytest suites, a
+frontend build check, then `python -m ingestion` and `dbt deps` / `seed` / `build`.
 
-## Status & Roadmap
+The point isn't a complex pipeline — it's that **a broken data model is caught
+before merge rather than discovered in the warehouse later**. The dbt step runs
+the full test suite against freshly loaded data, so a modeling change that violates
+a business rule fails the PR.
 
-This repo has a runnable MVP, a working ingestion pipeline, and a dbt analytics mart —
-but they're not all wired together yet. See [STATUS.md](STATUS.md) for exactly what's
-implemented, the current highest-risk issue, and the next planned deliverable
-(pointing `filter_engine.py` at Postgres instead of flat CSVs).
+## The application layer
+
+Secondary to the pipeline, but it exists so the marts have a real consumer rather
+than being a warehouse nobody queries.
+
+`GET /recommendations` runs a two-stage pipeline over the mart: hard feasibility
+filtering, then transparent component-based scoring (ZIP proximity, vibe-tag match,
+source confidence), each normalized 0–1 and blended into a 0–100 score. Any
+component whose input the user didn't provide is dropped and the remaining weights
+renormalized. Every result carries a `score`, `confidence_label`,
+`source_verified_date` and a rule-based explanation — no black-box ranking.
+
+Three modes: `specific` (category as a hard filter), `mood` (ranked by vibe match),
+`surprise` (weighted-random sample from the top pool, reproducible with a fixed
+seed). `GET /organizations` powers a "hidden gems" row from `mart_organizations`.
+`GET/POST/DELETE /favorites` persists per-device favorites in `raw.app_favorites`,
+keyed by an anonymous client-generated UUID — no login.
+
+The frontend is a single-screen React + Vite + TS Discover page, built into
+`backend/app/static/` and served from the same origin. For UI work, run Vite and
+FastAPI side by side:
+
+```bash
+cd backend && uvicorn app.main:app --reload --port 8000   # terminal 1
+cd frontend && npm install && npm run dev                 # terminal 2 → :5173
+```
+
+`vite.config.ts` proxies the API routes to port 8000, so no base URL is hardcoded.
+
+## Known limitations & what's next
+
+Stated plainly, because they're the honest boundary of what this demonstrates:
+
+- **History starts when recording started, not before.** The snapshot and the
+  observation fact table can only know what they have witnessed. Metrics that
+  depend on seeing a transition — cancellation rate, notice period — are `NULL`
+  until one is actually observed, and events already cancelled at first capture
+  are excluded from those denominators rather than guessed at. The numbers get
+  meaningful as the window widens; they are not meaningful on day one, and the
+  models say so via `observation_window_days`.
+- **Scheduled, but not monitored.** A daily workflow keeps history accumulating,
+  but there is no alerting if it silently stops — the only signal is source
+  freshness decaying until content drops out of the mart, which is passive and
+  after the fact.
+- **Content rests almost entirely on one source.** All ~200 recommendable events
+  come from NYC Parks; the five curated organizations contribute zero, because
+  their sample events expired and nobody re-curated them. The feed also skews
+  heavily toward fitness (~69%). This is visible in `mart_organizations` rather
+  than hidden.
+- **No geocoding or routing API.** ZIP proximity uses a small curated centroid
+  table, and transit time is a documented fixed-speed estimate from straight-line
+  distance, labeled as approximate in the UI.
+- **Rule-based scoring by choice.** Transparency is the point; a learned ranking
+  model would lose the per-result "why this fits" explanation.
+
+See [STATUS.md](STATUS.md) for the full current state, the highest-risk issue, and
+the sequenced next deliverables.
 
 ## License
 
