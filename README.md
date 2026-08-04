@@ -1,6 +1,6 @@
 # NYC Activity Discovery — an analytics engineering project
 
-[![CI](https://github.com/zhen01/nyc_activities/actions/workflows/ci.yml/badge.svg)](https://github.com/zhen01/nyc_activities/actions/workflows/ci.yml)
+[![CI](https://github.com/zhen01/nyc-open-data-pipeline/actions/workflows/ci.yml/badge.svg)](https://github.com/zhen01/nyc-open-data-pipeline/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
 
