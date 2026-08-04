@@ -1,0 +1,8 @@
+# The dbt docs site is generated output (a single 2.9 MB bundled index.html).
+# Left unmarked it is ~96% of the repo by byte count, so GitHub reports this
+# Python/dbt project as "HTML". Mark it generated so linguist skips it and
+# diffs stay readable.
+dbt/docs_site/** linguist-generated=true
+
+# Lockfiles are noise in review.
+uv.lock linguist-generated=true
